@@ -1,0 +1,18 @@
+# Build artifacts
+/gorkbot
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local configuration (contains credentials - never commit)
+config.json
+
+# Reference copies of other projects (local only)
+deps/
+
+# Editor and tooling state
+*.swp
+.crush/

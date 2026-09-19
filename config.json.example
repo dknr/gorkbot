@@ -1,0 +1,20 @@
+{
+  "homeserver": "https://matrix.example.org",
+  "user": "@gork:example.org",
+  "password": "change-me",
+  "recovery_key": "",
+  "database": "gorkbot.db",
+  "pickle_key": "gorkbot",
+  "device_name": "gorkbot",
+  "llm": {
+    "base_url": "http://localhost:8080",
+    "api_key": "",
+    "model": "llama-3.2-3b-instruct",
+    "max_history": 100,
+    "history_timeout": "15m"
+  },
+  "gork": {
+    "system_prompt": "You are gork, a witty troglodyte. Prefer brief, poignant responses.",
+    "mention": "@gork:example.org"
+  }
+}
