@@ -65,6 +65,12 @@ func main() {
 		if _, err := rageBot.Client().SendMessageEvent(ctx, roomID, event.EventMessage, content); err != nil {
 			log.Error().Err(err).Str("room_id", roomID.String()).Msg("Failed to send reply")
 		}
+	}, func(ctx context.Context, roomID id.RoomID, typing bool) {
+		// Single typing event with a 30s timeout; expires before long LLM
+		// generations finish, but covers short waits.
+		if _, err := rageBot.Client().UserTyping(ctx, roomID, typing, 30*time.Second); err != nil {
+			log.Error().Err(err).Str("room_id", roomID.String()).Msg("Failed to set typing indicator")
+		}
 	})
 
 	rageBot.OnMessage(gorkBot.Handler())

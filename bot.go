@@ -28,12 +28,15 @@ type Bot struct {
 	historyTimeout time.Duration
 	historyMgr     *RoomHistoryManager
 	replyFn        func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
+	typingFn       func(ctx context.Context, roomID id.RoomID, typing bool)
 	stopCh         chan struct{}
 }
 
 // NewBot creates a Bot from a config and LLM client. The sendReply function
-// is used to send the bot's reply to Matrix; it must not be nil.
-func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, sendReply func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)) *Bot {
+// is used to send the bot's reply to Matrix; it must not be nil. The
+// setTyping function, if non-nil, is used to show a typing indicator while
+// waiting on the LLM provider.
+func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, sendReply func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string), setTyping func(ctx context.Context, roomID id.RoomID, typing bool)) *Bot {
 	return &Bot{
 		log:            log,
 		mention:        config.Gork.Mention,
@@ -42,6 +45,7 @@ func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, sendReply
 		historyTimeout: config.LLM.historyTimeout,
 		historyMgr:     NewRoomHistoryManager(),
 		replyFn:        sendReply,
+		typingFn:       setTyping,
 		stopCh:         make(chan struct{}),
 	}
 }
@@ -170,6 +174,12 @@ func (b *Bot) handle(msg message) {
 	// Create a 2-minute timeout context for the LLM call.
 	ctx, cancel := context.WithTimeout(msg.ctx, 2*time.Minute)
 	defer cancel()
+
+	// Show a typing indicator while waiting on the LLM provider.
+	if b.typingFn != nil {
+		b.typingFn(msg.ctx, msg.roomID, true)
+		defer b.typingFn(msg.ctx, msg.roomID, false)
+	}
 
 	response, _, _, _, err := b.llmClient.Complete(ctx, hm.Messages())
 	if err != nil {
