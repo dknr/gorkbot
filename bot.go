@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -29,6 +30,8 @@ type Bot struct {
 	historyMgr     *RoomHistoryManager
 	replyFn        func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
 	typingFn       func(ctx context.Context, roomID id.RoomID, typing bool)
+	backfillMax    int
+	backfillWindow time.Duration
 	stopCh         chan struct{}
 }
 
@@ -46,6 +49,8 @@ func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, sendReply
 		historyMgr:     NewRoomHistoryManager(),
 		replyFn:        sendReply,
 		typingFn:       setTyping,
+		backfillMax:    config.Backfill.MaxMessages,
+		backfillWindow: config.Backfill.timeout,
 		stopCh:         make(chan struct{}),
 	}
 }
@@ -203,6 +208,100 @@ func (b *Bot) handle(msg message) {
 // Stop closes the bot's stop channel to signal the worker to exit.
 func (b *Bot) Stop() {
 	close(b.stopCh)
+}
+
+// Backfill loads recent room history into each room's context before the bot
+// starts syncing. It only keeps messages within the configured backfill window
+// and count, mirroring the LLM history limits so old messages are not
+// resurrected past the normal dropoff.
+func (b *Bot) Backfill(ctx context.Context, client *mautrix.Client) {
+	rooms, err := client.JoinedRooms(ctx)
+	if err != nil {
+		b.log.Error().Err(err).Msg("Failed to list joined rooms for backfill")
+		return
+	}
+	cutoff := time.Now().Add(-b.backfillWindow)
+	for _, roomID := range rooms.JoinedRooms {
+		b.backfillRoom(ctx, client, roomID, cutoff)
+	}
+}
+
+// backfillRoom fetches up to backfillMax message events from a room that are
+// newer than cutoff and feeds them into the room's history manager.
+func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID id.RoomID, cutoff time.Time) {
+	hm := b.historyMgr.GetOrCreate(roomID, b.maxHistory, b.historyTimeout)
+	var collected []llm.ChatMessage
+	from := ""
+	for len(collected) < b.backfillMax {
+		limit := b.backfillMax - len(collected)
+		resp, err := client.Messages(ctx, roomID, from, "", mautrix.DirectionBackward, nil, limit)
+		if err != nil {
+			b.log.Error().Err(err).Str("room_id", roomID.String()).Msg("Failed to fetch room history for backfill")
+			return
+		}
+		for _, evt := range resp.Chunk {
+			// Encrypted rooms return m.room.encrypted events; decrypt them so
+			// the message content is readable. REST-fetched events don't have
+			// their content parsed, so parse it first for the decryptor.
+			if evt.Type == event.EventEncrypted && client.Crypto != nil {
+				if err := evt.Content.ParseRaw(evt.Type); err != nil {
+					b.log.Warn().Err(err).Str("room_id", roomID.String()).Msg("Failed to parse encrypted event content during backfill")
+					continue
+				}
+				dec, err := client.Crypto.Decrypt(ctx, evt)
+				if err != nil {
+					b.log.Warn().Err(err).Str("room_id", roomID.String()).Msg("Failed to decrypt event during backfill")
+					continue
+				}
+				evt = dec
+			}
+			if evt.Type != event.EventMessage {
+				continue
+			}
+			if evt.Timestamp > 0 && cutoff.UnixMilli() > evt.Timestamp {
+				// Older than the backfill window. Pages are newest-first, so
+				// no further pages will be newer; stop paginating.
+				b.feedBackfill(roomID, hm, collected)
+				return
+			}
+			collected = append(collected, b.chatMessage(evt, client.UserID))
+			if len(collected) >= b.backfillMax {
+				b.feedBackfill(roomID, hm, collected)
+				return
+			}
+		}
+		if resp.End != "" || resp.Start == "" {
+			b.feedBackfill(roomID, hm, collected)
+			return
+		}
+		from = resp.Start
+	}
+	b.feedBackfill(roomID, hm, collected)
+}
+
+// feedBackfill adds collected messages to a history manager in chronological
+// order. Pages are newest-first, so the slice is reversed first.
+func (b *Bot) feedBackfill(roomID id.RoomID, hm *HistoryManager, collected []llm.ChatMessage) {
+	for i, j := 0, len(collected)-1; i < j; i, j = i+1, j-1 {
+		collected[i], collected[j] = collected[j], collected[i]
+	}
+	for _, msg := range collected {
+		hm.AddMessage(msg)
+	}
+	b.log.Info().
+		Str("room_id", roomID.String()).
+		Int("messages", len(collected)).
+		Msg("Backfilled room history")
+}
+
+// chatMessage converts a message event into an LLM chat message. The bot's own
+// messages become assistant turns so the LLM sees both sides of the room.
+func (b *Bot) chatMessage(evt *event.Event, selfID id.UserID) llm.ChatMessage {
+	body := evt.Content.AsMessage().Body
+	if evt.Sender == selfID {
+		return llm.ChatMessage{Role: "assistant", Content: body}
+	}
+	return llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + body}
 }
 
 // hasMention reports whether content contains mention at a word boundary.

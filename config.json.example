@@ -16,5 +16,9 @@
   "gork": {
     "system_prompt": "You are gork, a witty troglodyte. Prefer brief, poignant responses.",
     "mention": "@gork:example.org"
+  },
+  "backfill": {
+    "max_messages": 50,
+    "timeout": "24h"
   }
 }

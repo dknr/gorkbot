@@ -23,6 +23,15 @@ type GorkConfig struct {
 	Mention      string `json:"mention"`
 }
 
+// BackfillConfig controls how much room history is loaded into context on
+// startup. It mirrors the LLM history limits (max count + timeout) so backfill
+// cannot cross the history dropoff window.
+type BackfillConfig struct {
+	MaxMessages int    `json:"max_messages"`
+	Timeout     string `json:"timeout"`
+	timeout     time.Duration
+}
+
 // Config holds the application configuration.
 type Config struct {
 	Homeserver  string        `json:"homeserver"`
@@ -34,6 +43,7 @@ type Config struct {
 	DeviceName  string        `json:"device_name"`
 	LLM         LLMConfig     `json:"llm"`
 	Gork        GorkConfig    `json:"gork"`
+	Backfill    BackfillConfig `json:"backfill"`
 }
 
 // LoadConfig reads the bot config from a JSON file, applying defaults for any
@@ -79,5 +89,16 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Gork.Mention == "" {
 		cfg.Gork.Mention = cfg.User
 	}
+	if cfg.Backfill.MaxMessages == 0 {
+		cfg.Backfill.MaxMessages = 50
+	}
+	if cfg.Backfill.Timeout == "" {
+		cfg.Backfill.Timeout = "24h"
+	}
+	backfillDuration, err := time.ParseDuration(cfg.Backfill.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid backfill timeout %q: %w", cfg.Backfill.Timeout, err)
+	}
+	cfg.Backfill.timeout = backfillDuration
 	return &cfg, nil
 }

@@ -60,6 +60,12 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Gork.Mention != cfg.User {
 		t.Errorf("expected mention to default to user '@gork:example.org', got %q", cfg.Gork.Mention)
 	}
+	if cfg.Backfill.MaxMessages != 50 {
+		t.Errorf("expected default backfill max_messages 50, got %d", cfg.Backfill.MaxMessages)
+	}
+	if cfg.Backfill.timeout != 24*time.Hour {
+		t.Errorf("expected default backfill timeout 24h, got %v", cfg.Backfill.timeout)
+	}
 }
 
 func TestLoadConfigFull(t *testing.T) {
@@ -83,6 +89,10 @@ func TestLoadConfigFull(t *testing.T) {
 		},
 		"gork": {
 			"mention": "@gork:other.org"
+		},
+		"backfill": {
+			"max_messages": 25,
+			"timeout": "3h"
 		}
 	}`
 	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
@@ -105,6 +115,12 @@ func TestLoadConfigFull(t *testing.T) {
 	}
 	if cfg.Gork.Mention != "@gork:other.org" {
 		t.Errorf("expected mention '@gork:other.org', got %q", cfg.Gork.Mention)
+	}
+	if cfg.Backfill.MaxMessages != 25 {
+		t.Errorf("expected backfill max_messages 25, got %d", cfg.Backfill.MaxMessages)
+	}
+	if cfg.Backfill.timeout != 3*time.Hour {
+		t.Errorf("expected backfill timeout 3h, got %v", cfg.Backfill.timeout)
 	}
 }
 
