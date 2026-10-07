@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -29,11 +32,16 @@ type Bot struct {
 	mention        string
 	llmClient      *llm.Client
 	llmVision      *llm.Client
+	visionComplete func(ctx context.Context, imageBase64, mimeType, textPrompt string) (string, int, int, int, error)
 	imagePrompt    string
 	maxHistory     int
 	historyTimeout time.Duration
 	historyMgr     *RoomHistoryManager
 	mautrixClient  *mautrix.Client
+	joinedRoomsFn  func(ctx context.Context) (*mautrix.RespJoinedRooms, error)
+	messagesFn     func(ctx context.Context, roomID id.RoomID, from string, limit int) (*mautrix.RespMessages, error)
+	downloadFn     func(ctx context.Context, mxcURL id.ContentURI) (*http.Response, error)
+	selfID         id.UserID
 	workerCh       chan message
 	replyFn        func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
 	typingFn       func(ctx context.Context, roomID id.RoomID, typing bool)
@@ -107,7 +115,9 @@ func (r *RoomHistoryManager) GetOrCreate(room id.RoomID, maxMessages int, timeou
 // Handler returns an OnMessage handler for the bot. Callers should register it
 // with bot.OnMessage before calling bot.Run. This also starts the worker goroutine.
 func (b *Bot) Handler() func(ctx context.Context, evt *event.Event) {
-	b.workerCh = make(chan message, workerQueueSize)
+	if b.workerCh == nil {
+		b.workerCh = make(chan message, workerQueueSize)
+	}
 	go b.worker(b.workerCh)
 	return func(ctx context.Context, evt *event.Event) {
 		evtLog := b.log.With().Str("room_id", evt.RoomID.String()).Str("event_id", evt.ID.String()).Str("event_type", evt.Type.Type).Logger()
@@ -152,11 +162,32 @@ func (b *Bot) Handler() func(ctx context.Context, evt *event.Event) {
 	}
 }
 
+func (b *Bot) joinedRooms(ctx context.Context) (*mautrix.RespJoinedRooms, error) {
+	if b.joinedRoomsFn != nil {
+		return b.joinedRoomsFn(ctx)
+	}
+	return b.mautrixClient.JoinedRooms(ctx)
+}
+
+func (b *Bot) roomMessages(ctx context.Context, roomID id.RoomID, from string, limit int) (*mautrix.RespMessages, error) {
+	if b.messagesFn != nil {
+		return b.messagesFn(ctx, roomID, from, limit)
+	}
+	return b.mautrixClient.Messages(ctx, roomID, from, "", mautrix.DirectionBackward, nil, limit)
+}
+
+func (b *Bot) downloadMedia(ctx context.Context, mxcURL id.ContentURI) (*http.Response, error) {
+	if b.downloadFn != nil {
+		return b.downloadFn(ctx, mxcURL)
+	}
+	return b.mautrixClient.Download(ctx, mxcURL)
+}
+
 // handleImage processes an m.image or m.file message: downloads the media,
 // sends it through the vision model, adds the description to room history,
 // and feeds it into the worker queue if it triggers a mention.
 func (b *Bot) handleImage(ctx context.Context, evt *event.Event) {
-	if b.llmVision == nil {
+	if b.visionUnavailable() {
 		b.log.Debug().
 			Str("room_id", evt.RoomID.String()).
 			Str("sender", evt.Sender.String()).
@@ -192,7 +223,7 @@ func (b *Bot) handleImage(ctx context.Context, evt *event.Event) {
 	}
 
 	log.Debug().Msg("Downloading image")
-	resp, err := b.mautrixClient.Download(ctx, resolvedURL)
+	resp, err := b.downloadMedia(ctx, resolvedURL)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to download image")
 		return
@@ -253,13 +284,25 @@ func (b *Bot) handleImage(ctx context.Context, evt *event.Event) {
 	}
 }
 
+// visionUnavailable reports whether no vision model is configured.
+func (b *Bot) visionUnavailable() bool {
+	return b.visionComplete == nil && b.llmVision == nil
+}
+
 func (b *Bot) describeImage(ctx context.Context, imageBytes []byte, httpContentType string) (string, error) {
+	complete := b.visionComplete
+	if complete == nil && b.llmVision != nil {
+		complete = b.llmVision.CompleteMultimodal
+	}
+	if complete == nil {
+		return "", errors.New("no vision model configured")
+	}
 	mimeType := "image/jpeg"
 	if httpContentType != "" {
 		mimeType = httpContentType
 	}
 	imageBase64 := base64.StdEncoding.EncodeToString(imageBytes)
-	desc, _, _, _, err := b.llmVision.CompleteMultimodal(ctx, imageBase64, mimeType, b.imagePrompt)
+	desc, _, _, _, err := complete(ctx, imageBase64, mimeType, b.imagePrompt)
 	return desc, err
 }
 
@@ -319,11 +362,14 @@ func (b *Bot) handle(msg message) {
 		defer b.typingFn(msg.ctx, msg.roomID, false)
 	}
 
-	llmComplete := b.llmClient.Complete
+	var response string
+	var err error
 	if b.completeFn != nil {
-		llmComplete = b.completeFn
+		// Test seam: bypass the real client entirely.
+		response, _, _, _, err = b.completeFn(ctx, hm.Messages())
+	} else {
+		response, _, _, _, err = b.llmClient.Complete(ctx, hm.Messages())
 	}
-	response, _, _, _, err := llmComplete(ctx, hm.Messages())
 	if err != nil {
 		b.log.Error().
 			Err(err).
@@ -357,21 +403,21 @@ func (b *Bot) Stop() {
 // starts syncing. It only keeps messages within the configured backfill window
 // and count, mirroring the LLM history limits so old messages are not
 // resurrected past the normal dropoff.
-func (b *Bot) Backfill(ctx context.Context, client *mautrix.Client) {
-	rooms, err := client.JoinedRooms(ctx)
+func (b *Bot) Backfill(ctx context.Context) {
+	rooms, err := b.joinedRooms(ctx)
 	if err != nil {
 		b.log.Error().Err(err).Msg("Failed to list joined rooms for backfill")
 		return
 	}
 	cutoff := time.Now().Add(-b.backfillWindow)
 	for _, roomID := range rooms.JoinedRooms {
-		b.backfillRoom(ctx, client, roomID, cutoff)
+		b.backfillRoom(ctx, roomID, cutoff)
 	}
 }
 
 // backfillRoom fetches up to backfillMax message events from a room that are
 // newer than cutoff and feeds them into the room's history manager.
-func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID id.RoomID, cutoff time.Time) {
+func (b *Bot) backfillRoom(ctx context.Context, roomID id.RoomID, cutoff time.Time) {
 	hm := b.historyMgr.GetOrCreate(roomID, b.maxHistory, b.historyTimeout)
 	var collected []llm.ChatMessage
 	from := ""
@@ -382,7 +428,7 @@ func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID i
 		Msg("Starting backfill")
 	for len(collected) < b.backfillMax {
 		limit := b.backfillMax - len(collected)
-		resp, err := client.Messages(ctx, roomID, from, "", mautrix.DirectionBackward, nil, limit)
+		resp, err := b.roomMessages(ctx, roomID, from, limit)
 		if err != nil {
 			b.log.Error().Err(err).Str("room_id", roomID.String()).Msg("Failed to fetch room history for backfill")
 			return
@@ -391,12 +437,12 @@ func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID i
 			// Encrypted rooms return m.room.encrypted events; decrypt them so
 			// the message content is readable. REST-fetched events don't have
 			// their content parsed, so parse it first for the decryptor.
-			if evt.Type == event.EventEncrypted && client.Crypto != nil {
+			if evt.Type == event.EventEncrypted && b.mautrixClient != nil && b.mautrixClient.Crypto != nil {
 				if err := evt.Content.ParseRaw(evt.Type); err != nil {
 					b.log.Warn().Err(err).Str("room_id", roomID.String()).Msg("Failed to parse encrypted event content during backfill")
 					continue
 				}
-				dec, err := client.Crypto.Decrypt(ctx, evt)
+				dec, err := b.mautrixClient.Crypto.Decrypt(ctx, evt)
 				if err != nil {
 					b.log.Warn().Err(err).Str("room_id", roomID.String()).Msg("Failed to decrypt event during backfill")
 					continue
@@ -406,13 +452,28 @@ func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID i
 			if evt.Type != event.EventMessage {
 				continue
 			}
+			// Make the message content readable: REST-fetched events have their
+			// content parsed into a map during JSON decoding (and decrypted
+			// events get re-marshalled above, populating it too), but parse it
+			// defensively if only the raw bytes are present.
+			if evt.Content.Raw == nil && evt.Content.VeryRaw != nil {
+				var msg event.MessageEventContent
+				if err := json.Unmarshal(evt.Content.VeryRaw, &msg); err != nil {
+					b.log.Warn().Err(err).Str("room_id", roomID.String()).Msg("Failed to parse message content during backfill")
+					continue
+				}
+				evt.Content.Raw = map[string]interface{}{
+					"msgtype": msg.MsgType,
+					"body":    msg.Body,
+				}
+			}
 			if evt.Timestamp > 0 && cutoff.UnixMilli() > evt.Timestamp {
 				// Older than the backfill window. Pages are newest-first, so
 				// no further pages will be newer; stop paginating.
 				b.feedBackfill(roomID, hm, collected)
 				return
 			}
-			collected = append(collected, b.chatMessage(ctx, evt, client.UserID))
+			collected = append(collected, b.chatMessage(ctx, evt, b.selfID))
 			if len(collected) >= b.backfillMax {
 				b.feedBackfill(roomID, hm, collected)
 				return
@@ -467,7 +528,7 @@ func (b *Bot) chatMessage(ctx context.Context, evt *event.Event, selfID id.UserI
 // backfillDescribeImage downloads an image from a Matrix event and runs it
 // through the vision model. Returns the description or "" on any failure.
 func (b *Bot) backfillDescribeImage(ctx context.Context, evt *event.Event) string {
-	if b.llmVision == nil {
+	if b.visionUnavailable() {
 		return ""
 	}
 
@@ -485,7 +546,7 @@ func (b *Bot) backfillDescribeImage(ctx context.Context, evt *event.Event) strin
 		return ""
 	}
 
-	resp, err := b.mautrixClient.Download(ctx, resolvedURL)
+	resp, err := b.downloadMedia(ctx, resolvedURL)
 	if err != nil {
 		return ""
 	}

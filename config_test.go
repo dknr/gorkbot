@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,5 +170,64 @@ func TestLoadConfigMissingRequired(t *testing.T) {
 	_, err := LoadConfig(configPath)
 	if err == nil {
 		t.Fatal("expected error for missing user and password, got nil")
+	}
+}
+
+func TestLoadConfigInvalidHistoryTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+	configData := `{
+		"homeserver": "https://matrix.example.org",
+		"user": "@gork:example.org",
+		"password": "secret",
+		"llm": { "history_timeout": "not-a-duration" }
+	}`
+	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(configPath)
+	if err == nil {
+		t.Fatal("expected error for invalid history_timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "history_timeout") {
+		t.Errorf("expected error to mention history_timeout, got: %v", err)
+	}
+}
+
+func TestLoadConfigInvalidBackfillTimeout(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+	configData := `{
+		"homeserver": "https://matrix.example.org",
+		"user": "@gork:example.org",
+		"password": "secret",
+		"backfill": { "timeout": "soon" }
+	}`
+	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfig(configPath)
+	if err == nil {
+		t.Fatal("expected error for invalid backfill timeout, got nil")
+	}
+	if !strings.Contains(err.Error(), "backfill") {
+		t.Errorf("expected error to mention backfill, got: %v", err)
+	}
+}
+
+func TestLoadConfigInvalidJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(configPath, []byte("{ not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(configPath); err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
+func TestLoadConfigMissingFile(t *testing.T) {
+	if _, err := LoadConfig(filepath.Join(t.TempDir(), "does-not-exist.json")); err == nil {
+		t.Fatal("expected error for missing config file, got nil")
 	}
 }

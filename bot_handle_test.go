@@ -20,11 +20,14 @@ func newTestBot(t *testing.T, fake *testutil.Client, replies *[]string, typing *
 	b := &Bot{
 		log:            log,
 		mention:        "@gork:example.org",
+		imagePrompt:    "Describe what you see in this image",
 		maxHistory:     10,
 		historyTimeout: time.Minute,
 		historyMgr:     NewRoomHistoryManager(),
 		replyFn: func(_ context.Context, _ id.RoomID, _ id.EventID, response string) {
-			*replies = append(*replies, response)
+			if replies != nil {
+				*replies = append(*replies, response)
+			}
 		},
 		completeFn: fake.Complete,
 		stopCh:     make(chan struct{}),

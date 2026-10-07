@@ -103,7 +103,8 @@ func main() {
 	rageBot.OnMessage(gorkBot.Handler())
 
 	log.Info().Msg("Gork is running")
-	gorkBot.Backfill(ctx, rageBot.Client())
+	gorkBot.selfID = rageBot.Client().UserID
+	gorkBot.Backfill(ctx)
 	if err := rageBot.Run(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Bot failed")
 	}

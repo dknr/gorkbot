@@ -207,3 +207,157 @@ func TestNewClient(t *testing.T) {
 		t.Errorf("expected SystemPrompt 'sys', got %q", c.SystemPrompt)
 	}
 }
+
+func TestCompleteMultimodalHappyPath(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("expected path /chat/completions, got %s", r.URL.Path)
+		}
+		var req ChatRequestMultimodal
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		if req.Model != "vision-model" {
+			t.Errorf("expected model vision-model, got %s", req.Model)
+		}
+		if len(req.Messages) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(req.Messages))
+		}
+		if req.Messages[0].Role != "system" {
+			t.Errorf("expected first message system, got %s", req.Messages[0].Role)
+		}
+		if len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Type != "text" {
+			t.Errorf("expected system text part, got %+v", req.Messages[0].Content)
+		}
+		if req.Messages[0].Content[0].Text != "You are a vision test." {
+			t.Errorf("unexpected system prompt %q", req.Messages[0].Content[0].Text)
+		}
+		if req.Messages[1].Role != "user" {
+			t.Errorf("expected second message user, got %s", req.Messages[1].Role)
+		}
+		parts := req.Messages[1].Content
+		if len(parts) != 2 {
+			t.Fatalf("expected 2 user content parts, got %d", len(parts))
+		}
+		if parts[0].Type != "image_url" || parts[0].ImageURL == nil {
+			t.Fatalf("expected image_url part, got %+v", parts[0])
+		}
+		wantURL := "data:image/png;base64,QUJD"
+		if parts[0].ImageURL.URL != wantURL {
+			t.Errorf("expected image URL %q, got %q", wantURL, parts[0].ImageURL.URL)
+		}
+		if parts[1].Type != "text" || parts[1].Text != "describe it" {
+			t.Errorf("expected text part 'describe it', got %+v", parts[1])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{
+			Choices: []Choice{{Message: Message{Content: " a rock"}}},
+			Usage:   UsageInfo{PromptTokens: 5, CompletionTokens: 7, TotalTokens: 12},
+		})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "You are a vision test.")
+	content, pt, ct, tt, err := c.CompleteMultimodal(context.Background(), "QUJD", "image/png", "describe it")
+	if err != nil {
+		t.Fatalf("CompleteMultimodal() error: %v", err)
+	}
+	if content != "a rock" {
+		t.Errorf("expected trimmed 'a rock', got %q", content)
+	}
+	if pt != 5 || ct != 7 || tt != 12 {
+		t.Errorf("expected usage (5, 7, 12), got (%d, %d, %d)", pt, ct, tt)
+	}
+}
+
+func TestCompleteMultimodalNonImageMimeFallsBackToJPEG(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatRequestMultimodal
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		parts := req.Messages[1].Content
+		if parts[0].ImageURL.URL != "data:image/jpeg;base64,QQ==" {
+			t.Errorf("expected jpeg fallback data URL, got %q", parts[0].ImageURL.URL)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Choices: []Choice{{Message: Message{Content: "ok"}}}})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "sys")
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QQ==", "text/plain", "p"); err != nil {
+		t.Fatalf("CompleteMultimodal() error: %v", err)
+	}
+}
+
+func TestCompleteMultimodalAuthHeader(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "Bearer vision-key" {
+			t.Errorf("expected Authorization 'Bearer vision-key', got %q", auth)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Choices: []Choice{{Message: Message{Content: "ok"}}}})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "vision-key", "")
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QQ==", "image/png", "p"); err != nil {
+		t.Fatalf("CompleteMultimodal() error: %v", err)
+	}
+}
+
+func TestCompleteMultimodalNon200(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "")
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QQ==", "image/png", "p"); err == nil {
+		t.Fatal("expected error for non-200 status, got nil")
+	}
+}
+
+func TestCompleteMultimodalNoChoices(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "")
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QQ==", "image/png", "p"); err == nil {
+		t.Fatal("expected error for empty choices, got nil")
+	}
+}
+
+func TestCompleteMultimodalInvalidJSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "not json")
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "")
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QQ==", "image/png", "p"); err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
+func TestCompleteMultimodalContextCancelled(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Choices: []Choice{{Message: Message{Content: "ok"}}}})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, _, err := c.CompleteMultimodal(ctx, "QQ==", "image/png", "p"); err == nil {
+		t.Fatal("expected error for cancelled context, got nil")
+	}
+}

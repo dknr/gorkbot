@@ -86,6 +86,18 @@ func TestExtractPrompt(t *testing.T) {
 			mention: "@gork:caos.one",
 			want:    "",
 		},
+		{
+			name:    "short form when full mention absent at boundary",
+			content: "hey @gork what's up",
+			mention: "@gork:caos.one",
+			want:    "what's up",
+		},
+		{
+			name:    "full mention preferred over short form",
+			content: "@gork:caos.one and @gork both",
+			mention: "@gork:caos.one",
+			want:    "and @gork both",
+		},
 	}
 
 	for _, tt := range tests {
@@ -189,6 +201,24 @@ func TestExtractHTMLPrompt(t *testing.T) {
 			html:    `hello world`,
 			mention: "@gork:caos.one",
 			want:    "",
+		},
+		{
+			name:    "mention at end returns empty",
+			html:    `<a href="https://matrix.to/#/@gork:caos.one">gork</a>`,
+			mention: "@gork:caos.one",
+			want:    "",
+		},
+		{
+			name:    "text in element sibling after mention",
+			html:    `<a href="https://matrix.to/#/@gork:caos.one">gork</a><strong>bold prompt</strong>`,
+			mention: "@gork:caos.one",
+			want:    "bold prompt",
+		},
+		{
+			name:    "malformed html returns empty",
+			html:    `<a href="https://matrix.to/#/@gork:caos.one">gork</a><b>unclosed`,
+			mention: "@gork:caos.one",
+			want:    "unclosed",
 		},
 	}
 
