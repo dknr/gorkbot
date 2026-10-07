@@ -101,6 +101,32 @@ make run   # build and run locally
 
 Or manually: `./gorkbot -config config.json`.
 
+## Console mode (no Matrix)
+
+`-console` runs gork against stdin/stdout instead of a homeserver, for
+prompt iteration and testing without a running Matrix server:
+
+```sh
+./gorkbot -console -config config.json
+```
+
+- Each line of input is a prompt; replies are written to **stdout**
+  (logs and the banner go to stderr, so stdout is clean for piping).
+- The mention gate is bypassed — every line is answered.
+- A line ending in `...` continues a multi-line prompt.
+- `exit`/`quit` or Ctrl-D stops the session. Conversation history persists
+  across prompts within the session, just like a Matrix room.
+
+Since it's just bytes on pipes, it also works over a serial console:
+
+```sh
+socat -raw,echo=0 /dev/ttyUSB0,115200n8 - | ./gorkbot -console -config config.json
+```
+
+In console mode the Matrix credentials in the config are ignored (a config
+with only `llm` and `gork` sections is enough). Vision is not available in
+this mode.
+
 ## License
 
 ISC

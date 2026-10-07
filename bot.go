@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -43,6 +44,7 @@ type Bot struct {
 	downloadFn     func(ctx context.Context, mxcURL id.ContentURI) (*http.Response, error)
 	selfID         id.UserID
 	workerCh       chan message
+	workerDone     chan struct{}
 	replyFn        func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
 	typingFn       func(ctx context.Context, roomID id.RoomID, typing bool)
 	backfillMax    int
@@ -307,11 +309,15 @@ func (b *Bot) describeImage(ctx context.Context, imageBytes []byte, httpContentT
 }
 
 // worker processes messages one at a time so LLM calls never block the read
-// loop and history stays consistent.
+// loop and history stays consistent. It exits when workerCh is closed or
+// b.stopCh is closed.
 func (b *Bot) worker(workerCh <-chan message) {
 	for {
 		select {
-		case msg := <-workerCh:
+		case msg, ok := <-workerCh:
+			if !ok {
+				return
+			}
 			b.handle(msg)
 		case <-b.stopCh:
 			return
@@ -392,6 +398,81 @@ func (b *Bot) handle(msg message) {
 		Str("response", response).
 		Msg("Sending reply")
 	b.replyFn(msg.ctx, msg.roomID, msg.eventID, response)
+}
+
+// ConsoleRoom is the pseudo-room used for stdin/stdout mode. There is no
+// Matrix room involved; the whole conversation is one session.
+const ConsoleRoom = "!console:local"
+
+// RunConsole reads user input line-by-line from in and replies via the bot's
+// replyFn, using the single console room's history. It blocks until in
+// reaches EOF or ctx is cancelled. Multi-line input is supported: a line
+// ending in "..." continues until a line that does not. The mention gate is
+// bypassed; every complete line is treated as a prompt to the LLM. "exit" or
+// "quit" exits the loop. The worker is drained before returning, so the last
+// reply is delivered. If completeFn is non-nil it is used instead of the real
+// LLM client (test seam).
+func (b *Bot) RunConsole(ctx context.Context, in io.Reader) {
+	workerCh := make(chan message, workerQueueSize)
+	b.workerDone = make(chan struct{})
+	go func() {
+		b.worker(workerCh)
+		close(b.workerDone)
+	}()
+	defer func() {
+		// Drain the queue so the last reply is delivered before returning.
+		close(workerCh)
+		<-b.workerDone
+	}()
+
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var pending strings.Builder
+	for sc.Scan() {
+		line := strings.TrimRight(sc.Text(), " \t\r")
+		if pending.Len() == 0 {
+			switch strings.ToLower(line) {
+			case "exit", "quit":
+				return
+			case "":
+				continue
+			}
+		}
+		if strings.HasSuffix(line, "...") {
+			pending.WriteString(line[:len(line)-3])
+			pending.WriteByte('\n')
+			continue
+		}
+		body := line
+		if pending.Len() > 0 {
+			body = pending.String() + line
+			pending.Reset()
+		}
+		body = strings.TrimSpace(body)
+		if body == "" {
+			continue
+		}
+		b.log.Debug().Str("body", body).Msg("Console message received")
+		msg := message{
+			ctx:       ctx,
+			roomID:    id.RoomID(ConsoleRoom),
+			sender:    "user",
+			body:      body,
+			mentioned: true,
+			prompt:    body,
+		}
+		select {
+		case workerCh <- msg:
+		case <-ctx.Done():
+			return
+		default:
+			b.log.Warn().Msg("Console worker queue full, dropping message")
+		}
+	}
+	if err := sc.Err(); err != nil {
+		b.log.Error().Err(err).Msg("Console input read failed")
+	}
 }
 
 // Stop closes the bot's stop channel to signal the worker to exit.

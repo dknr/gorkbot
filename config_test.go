@@ -21,7 +21,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(configPath)
+	cfg, err := LoadConfig(configPath, false)
 	if err != nil {
 		t.Fatalf("LoadConfig() error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestLoadConfigFull(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(configPath)
+	cfg, err := LoadConfig(configPath, false)
 	if err != nil {
 		t.Fatalf("LoadConfig() error: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestLoadConfigMarkdownDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadConfig(configPath)
+	cfg, err := LoadConfig(configPath, false)
 	if err != nil {
 		t.Fatalf("LoadConfig() error: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestLoadConfigMissingRequired(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := LoadConfig(configPath)
+	_, err := LoadConfig(configPath, false)
 	if err == nil {
 		t.Fatal("expected error for missing user and password, got nil")
 	}
@@ -185,7 +185,7 @@ func TestLoadConfigInvalidHistoryTimeout(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadConfig(configPath)
+	_, err := LoadConfig(configPath, false)
 	if err == nil {
 		t.Fatal("expected error for invalid history_timeout, got nil")
 	}
@@ -206,7 +206,7 @@ func TestLoadConfigInvalidBackfillTimeout(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadConfig(configPath)
+	_, err := LoadConfig(configPath, false)
 	if err == nil {
 		t.Fatal("expected error for invalid backfill timeout, got nil")
 	}
@@ -221,13 +221,47 @@ func TestLoadConfigInvalidJSON(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("{ not json"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadConfig(configPath); err == nil {
+	if _, err := LoadConfig(configPath, false); err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
 	}
 }
 
 func TestLoadConfigMissingFile(t *testing.T) {
-	if _, err := LoadConfig(filepath.Join(t.TempDir(), "does-not-exist.json")); err == nil {
+	if _, err := LoadConfig(filepath.Join(t.TempDir(), "does-not-exist.json"), false); err == nil {
 		t.Fatal("expected error for missing config file, got nil")
+	}
+}
+
+func TestLoadConfigConsoleMode(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+
+	// No Matrix credentials: invalid for Matrix mode, valid for console mode.
+	configData := `{
+		"llm": {
+			"base_url": "http://localhost:8080",
+			"model": "test-model"
+		},
+		"gork": {
+			"system_prompt": "You are gork."
+		}
+	}`
+	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadConfig(configPath, false); err == nil {
+		t.Fatal("expected error for missing matrix credentials in matrix mode, got nil")
+	}
+
+	cfg, err := LoadConfig(configPath, true)
+	if err != nil {
+		t.Fatalf("LoadConfig(console) error: %v", err)
+	}
+	if cfg.Gork.SystemPrompt != "You are gork." {
+		t.Errorf("expected system prompt preserved, got %q", cfg.Gork.SystemPrompt)
+	}
+	if cfg.Gork.Mention != "" {
+		t.Errorf("expected empty mention in console mode, got %q", cfg.Gork.Mention)
 	}
 }

@@ -58,7 +58,10 @@ type Config struct {
 
 // LoadConfig reads the bot config from a JSON file, applying defaults for any
 // field that is omitted.
-func LoadConfig(path string) (*Config, error) {
+// LoadConfig reads the bot config from a JSON file, applying defaults for any
+// field that is omitted. When console is true, Matrix credentials are not
+// required; the bot runs against stdin/stdout instead of a homeserver.
+func LoadConfig(path string, console bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -67,7 +70,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
-	if cfg.Homeserver == "" || cfg.User == "" || cfg.Password == "" {
+	if !console && (cfg.Homeserver == "" || cfg.User == "" || cfg.Password == "") {
 		return nil, fmt.Errorf("homeserver, user and password are required in the config")
 	}
 	if cfg.Database == "" {

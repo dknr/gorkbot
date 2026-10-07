@@ -20,13 +20,8 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to the configuration file")
+	console := flag.Bool("console", false, "run without Matrix: read prompts from stdin, write replies to stdout")
 	flag.Parse()
-
-	cfg, err := LoadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
-	}
 
 	logFile, err := os.OpenFile("gorkbot.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -34,9 +29,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Write to both console and file.
+	// Console mode keeps stdout for gork's replies, so logs go to stderr and
+	// the log file; Matrix mode logs to the console and the log file.
+	out := os.Stdout
+	if *console {
+		out = os.Stderr
+	}
 	consoleWriter := zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
 		w.TimeFormat = time.StampMilli
+		w.Out = out
 	})
 	multiWriter := io.MultiWriter(consoleWriter, logFile)
 
@@ -44,6 +45,33 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	cfg, err := LoadConfig(*configPath, *console)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to load config")
+	}
+
+	llmClient := llm.NewClient(
+		cfg.LLM.BaseURL,
+		cfg.LLM.Model,
+		cfg.LLM.APIKey,
+		cfg.Gork.SystemPrompt,
+	)
+
+	if *console {
+		runConsole(ctx, log, cfg, llmClient)
+		return
+	}
+
+	var llmVision *llm.Client
+	if cfg.LLMVision.BaseURL != "" {
+		llmVision = llm.NewClient(
+			cfg.LLMVision.BaseURL,
+			cfg.LLMVision.Model,
+			cfg.LLMVision.APIKey,
+			"Describe what you see in this image in detail",
+		)
+	}
 
 	rageBot, err := ragecore.New(ctx, &ragecore.Config{
 		Homeserver:  cfg.Homeserver,
@@ -56,23 +84,6 @@ func main() {
 	}, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to start ragecore bot")
-	}
-
-	llmClient := llm.NewClient(
-		cfg.LLM.BaseURL,
-		cfg.LLM.Model,
-		cfg.LLM.APIKey,
-		cfg.Gork.SystemPrompt,
-	)
-
-	var llmVision *llm.Client
-	if cfg.LLMVision.BaseURL != "" {
-		llmVision = llm.NewClient(
-			cfg.LLMVision.BaseURL,
-			cfg.LLMVision.Model,
-			cfg.LLMVision.APIKey,
-			"Describe what you see in this image in detail",
-		)
 	}
 
 	gorkBot := NewBot(log, cfg, llmClient, llmVision, rageBot.Client(), func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string) {
@@ -108,4 +119,20 @@ func main() {
 	if err := rageBot.Run(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Bot failed")
 	}
+}
+
+// runConsole runs gork without Matrix: each stdin line is a prompt and each
+// LLM reply is written to stdout, one response per block.
+func runConsole(ctx context.Context, log zerolog.Logger, cfg *Config, llmClient *llm.Client) {
+	gorkBot := NewBot(log, cfg, llmClient, nil, nil,
+		func(_ context.Context, _ id.RoomID, _ id.EventID, response string) {
+			fmt.Fprintln(os.Stdout, response)
+		},
+		nil,
+	)
+
+	// Banner to stderr: stdout is reserved for gork's replies so it can be
+	// piped cleanly (e.g. over a serial console with socat).
+	fmt.Fprintln(os.Stderr, "gork console: type a prompt per line; '...' continues a line; exit/quit or Ctrl-D to stop")
+	gorkBot.RunConsole(ctx, os.Stdin)
 }
