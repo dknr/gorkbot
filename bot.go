@@ -232,7 +232,7 @@ func (b *Bot) handleImage(ctx context.Context, evt *event.Event) {
 		Msg("Image described")
 
 	hm := b.historyMgr.GetOrCreate(evt.RoomID, b.maxHistory, b.historyTimeout)
-	hm.AddMessage(llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + description})
+	hm.AddMessage(llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": [📷 image] " + description})
 	log.Debug().Msg("Added image description to history")
 
 	// Check if description triggers mention
@@ -446,7 +446,7 @@ func (b *Bot) chatMessage(ctx context.Context, evt *event.Event, selfID id.UserI
 	if content.MsgType == event.MsgImage || content.MsgType == event.MsgFile {
 		description := b.backfillDescribeImage(ctx, evt)
 		if description != "" {
-			return llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + description}
+			return llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": [📷 image] " + description}
 		}
 	}
 
