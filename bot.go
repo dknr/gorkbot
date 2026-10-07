@@ -462,6 +462,9 @@ func (b *Bot) backfillDescribeImage(ctx context.Context, evt *event.Event) strin
 
 	content := evt.Content.AsMessage()
 	mediaURL := content.URL
+	if mediaURL == "" && content.File != nil {
+		mediaURL = content.File.URL
+	}
 	if mediaURL == "" {
 		return ""
 	}
@@ -477,7 +480,13 @@ func (b *Bot) backfillDescribeImage(ctx context.Context, evt *event.Event) strin
 	}
 	defer resp.Body.Close()
 
-	imageBytes, err := io.ReadAll(resp.Body)
+	encryptedBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	// Decrypt the image data (Matrix encrypts media in encrypted rooms)
+	imageBytes, err := content.File.Decrypt(encryptedBytes)
 	if err != nil {
 		return ""
 	}
