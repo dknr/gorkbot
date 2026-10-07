@@ -40,6 +40,7 @@ type Bot struct {
 	backfillMax    int
 	backfillWindow time.Duration
 	stopCh         chan struct{}
+	completeFn     func(ctx context.Context, history []llm.ChatMessage) (string, int, int, int, error)
 }
 
 // NewBot creates a Bot from a config and LLM client. The sendReply function
@@ -318,8 +319,18 @@ func (b *Bot) handle(msg message) {
 		defer b.typingFn(msg.ctx, msg.roomID, false)
 	}
 
-	response, _, _, _, err := b.llmClient.Complete(ctx, hm.Messages())
+	llmComplete := b.llmClient.Complete
+	if b.completeFn != nil {
+		llmComplete = b.completeFn
+	}
+	response, _, _, _, err := llmComplete(ctx, hm.Messages())
 	if err != nil {
+		b.log.Error().
+			Err(err).
+			Str("room_id", msg.roomID.String()).
+			Str("sender", msg.sender).
+			Msg("LLM call failed")
+		b.replyFn(msg.ctx, msg.roomID, msg.eventID, "gork fail. try again later.")
 		return
 	}
 

@@ -16,3 +16,6 @@ deps/
 # Editor and tooling state
 *.swp
 .crush/
+
+# Review notes
+REVIEW.md
