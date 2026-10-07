@@ -13,9 +13,16 @@
     "max_history": 100,
     "history_timeout": "15m"
   },
+  "llm_vision": {
+    "base_url": "",
+    "api_key": "",
+    "model": "ggml-org/Qwen2-VL-2B-Instruct-GGUF",
+    "image_prompt": "Describe what you see in this image"
+  },
   "gork": {
     "system_prompt": "You are gork, a witty troglodyte. Prefer brief, poignant responses.",
-    "mention": "@gork:example.org"
+    "mention": "@gork:example.org",
+    "markdown": true
   },
   "backfill": {
     "max_messages": 50,

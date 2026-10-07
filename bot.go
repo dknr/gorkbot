@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +28,13 @@ type Bot struct {
 	log            zerolog.Logger
 	mention        string
 	llmClient      *llm.Client
+	llmVision      *llm.Client
+	imagePrompt    string
 	maxHistory     int
 	historyTimeout time.Duration
 	historyMgr     *RoomHistoryManager
+	mautrixClient  *mautrix.Client
+	workerCh       chan message
 	replyFn        func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
 	typingFn       func(ctx context.Context, roomID id.RoomID, typing bool)
 	backfillMax    int
@@ -38,12 +45,16 @@ type Bot struct {
 // NewBot creates a Bot from a config and LLM client. The sendReply function
 // is used to send the bot's reply to Matrix; it must not be nil. The
 // setTyping function, if non-nil, is used to show a typing indicator while
-// waiting on the LLM provider.
-func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, sendReply func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string), setTyping func(ctx context.Context, roomID id.RoomID, typing bool)) *Bot {
+// waiting on the LLM provider. If llmVision is nil, image events are silently
+// ignored. The mautrixClient is used for downloading images from Matrix.
+func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, llmVision *llm.Client, mautrixClient *mautrix.Client, sendReply func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string), setTyping func(ctx context.Context, roomID id.RoomID, typing bool)) *Bot {
 	return &Bot{
 		log:            log,
 		mention:        config.Gork.Mention,
 		llmClient:      llmClient,
+		llmVision:      llmVision,
+		imagePrompt:    config.LLMVision.ImagePrompt,
+		mautrixClient:  mautrixClient,
 		maxHistory:     config.LLM.MaxHistory,
 		historyTimeout: config.LLM.historyTimeout,
 		historyMgr:     NewRoomHistoryManager(),
@@ -93,13 +104,23 @@ func (r *RoomHistoryManager) GetOrCreate(room id.RoomID, maxMessages int, timeou
 }
 
 // Handler returns an OnMessage handler for the bot. Callers should register it
-// with bot.OnMessage before calling bot.Run.
+// with bot.OnMessage before calling bot.Run. This also starts the worker goroutine.
 func (b *Bot) Handler() func(ctx context.Context, evt *event.Event) {
-	workerCh := make(chan message, workerQueueSize)
-	go b.worker(workerCh)
+	b.workerCh = make(chan message, workerQueueSize)
+	go b.worker(b.workerCh)
 	return func(ctx context.Context, evt *event.Event) {
-		body := evt.Content.AsMessage().Body
-		formattedBody := evt.Content.AsMessage().FormattedBody
+		evtLog := b.log.With().Str("room_id", evt.RoomID.String()).Str("event_id", evt.ID.String()).Str("event_type", evt.Type.Type).Logger()
+		evtLog.Debug().Msg("Handler received event")
+		content := evt.Content.AsMessage()
+
+		// Handle image/file messages: download, describe, add to history.
+		if content.MsgType == event.MsgImage || content.MsgType == event.MsgFile {
+			b.handleImage(ctx, evt)
+			return
+		}
+
+		body := content.Body
+		formattedBody := content.FormattedBody
 		if body == "" && formattedBody == "" {
 			return
 		}
@@ -123,11 +144,122 @@ func (b *Bot) Handler() func(ctx context.Context, evt *event.Event) {
 		}
 
 		select {
-		case workerCh <- message{ctx: ctx, roomID: evt.RoomID, sender: evt.Sender.String(), body: body, formattedBody: formattedBody, mentioned: mentioned, prompt: prompt}:
+		case b.workerCh <- message{ctx: ctx, roomID: evt.RoomID, sender: evt.Sender.String(), body: body, formattedBody: formattedBody, mentioned: mentioned, prompt: prompt}:
 		default:
 			// Worker queue full; drop the message.
 		}
 	}
+}
+
+// handleImage processes an m.image or m.file message: downloads the media,
+// sends it through the vision model, adds the description to room history,
+// and feeds it into the worker queue if it triggers a mention.
+func (b *Bot) handleImage(ctx context.Context, evt *event.Event) {
+	if b.llmVision == nil {
+		b.log.Debug().
+			Str("room_id", evt.RoomID.String()).
+			Str("sender", evt.Sender.String()).
+			Msg("Image received but vision model not configured, skipping")
+		return
+	}
+
+	content := evt.Content.AsMessage()
+	log := b.log.With().
+		Str("room_id", evt.RoomID.String()).
+		Str("sender", evt.Sender.String()).
+		Str("msgtype", string(content.MsgType)).
+		Str("body", content.Body).
+		Logger()
+
+	log.Info().Msg("Processing image message")
+
+	// Download the media
+	mediaURL := content.URL
+	if mediaURL == "" && content.File != nil {
+		mediaURL = content.File.URL
+	}
+	if mediaURL == "" {
+		log.Warn().Str("has_file", fmt.Sprintf("%t", content.File != nil)).Msg("No media URL in image event")
+		return
+	}
+	log.Debug().Str("media_url", string(mediaURL)).Msg("Got media URL")
+
+	resolvedURL, err := mediaURL.Parse()
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to parse media URL")
+		return
+	}
+
+	log.Debug().Msg("Downloading image")
+	resp, err := b.mautrixClient.Download(ctx, resolvedURL)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to download image")
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Debug().
+		Str("content_type", resp.Header.Get("Content-Type")).
+		Int64("content_length", resp.ContentLength).
+		Msg("Downloaded image headers")
+
+	encryptedBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to read image data")
+		return
+	}
+
+	// Decrypt the image data (Matrix encrypts media in encrypted rooms)
+	imageBytes, err := content.File.Decrypt(encryptedBytes)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to decrypt image data")
+		return
+	}
+
+	log.Debug().
+		Int("image_bytes", len(imageBytes)).
+		Msg("Read image data")
+
+	description, err := b.describeImage(ctx, imageBytes, resp.Header.Get("Content-Type"))
+	if err != nil {
+		log.Error().Err(err).Msg("Vision model failed")
+		return
+	}
+
+	log.Info().
+		Int("image_bytes", len(imageBytes)).
+		Str("description", description).
+		Msg("Image described")
+
+	hm := b.historyMgr.GetOrCreate(evt.RoomID, b.maxHistory, b.historyTimeout)
+	hm.AddMessage(llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + description})
+	log.Debug().Msg("Added image description to history")
+
+	// Check if description triggers mention
+	if hasMention(description, b.mention) {
+		prompt := extractPrompt(description, b.mention)
+		log.Debug().
+			Str("description", description).
+			Str("mention", b.mention).
+			Msg("Description contains mention, feeding to worker")
+		select {
+		case b.workerCh <- message{ctx: ctx, roomID: evt.RoomID, sender: evt.Sender.String(), body: description, mentioned: true, prompt: prompt}:
+		default:
+			log.Warn().Msg("Image mention: worker queue full, dropping")
+		}
+	} else {
+		log.Debug().Msg("Description does not contain mention")
+	}
+}
+
+func (b *Bot) describeImage(ctx context.Context, imageBytes []byte, httpContentType string) (string, error) {
+	mimeType := "image/jpeg"
+	if httpContentType != "" {
+		mimeType = httpContentType
+	}
+	imageBase64 := base64.StdEncoding.EncodeToString(imageBytes)
+	desc, _, _, _, err := b.llmVision.CompleteMultimodal(ctx, imageBase64, mimeType, b.imagePrompt)
+	return desc, err
 }
 
 // worker processes messages one at a time so LLM calls never block the read
@@ -232,6 +364,11 @@ func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID i
 	hm := b.historyMgr.GetOrCreate(roomID, b.maxHistory, b.historyTimeout)
 	var collected []llm.ChatMessage
 	from := ""
+	b.log.Debug().
+		Str("room_id", roomID.String()).
+		Int("max_messages", b.backfillMax).
+		Time("cutoff", cutoff).
+		Msg("Starting backfill")
 	for len(collected) < b.backfillMax {
 		limit := b.backfillMax - len(collected)
 		resp, err := client.Messages(ctx, roomID, from, "", mautrix.DirectionBackward, nil, limit)
@@ -264,7 +401,7 @@ func (b *Bot) backfillRoom(ctx context.Context, client *mautrix.Client, roomID i
 				b.feedBackfill(roomID, hm, collected)
 				return
 			}
-			collected = append(collected, b.chatMessage(evt, client.UserID))
+			collected = append(collected, b.chatMessage(ctx, evt, client.UserID))
 			if len(collected) >= b.backfillMax {
 				b.feedBackfill(roomID, hm, collected)
 				return
@@ -296,12 +433,61 @@ func (b *Bot) feedBackfill(roomID id.RoomID, hm *HistoryManager, collected []llm
 
 // chatMessage converts a message event into an LLM chat message. The bot's own
 // messages become assistant turns so the LLM sees both sides of the room.
-func (b *Bot) chatMessage(evt *event.Event, selfID id.UserID) llm.ChatMessage {
-	body := evt.Content.AsMessage().Body
+// For image messages, it calls the vision model to get a description of the
+// image content; if the vision model is unavailable or fails, it falls back
+// to the body text (alt text / filename).
+func (b *Bot) chatMessage(ctx context.Context, evt *event.Event, selfID id.UserID) llm.ChatMessage {
+	content := evt.Content.AsMessage()
 	if evt.Sender == selfID {
-		return llm.ChatMessage{Role: "assistant", Content: body}
+		return llm.ChatMessage{Role: "assistant", Content: content.Body}
 	}
-	return llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + body}
+
+	// For image messages, try to get a vision description.
+	if content.MsgType == event.MsgImage || content.MsgType == event.MsgFile {
+		description := b.backfillDescribeImage(ctx, evt)
+		if description != "" {
+			return llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + description}
+		}
+	}
+
+	return llm.ChatMessage{Role: "user", Content: evt.Sender.String() + ": " + content.Body}
+}
+
+// backfillDescribeImage downloads an image from a Matrix event and runs it
+// through the vision model. Returns the description or "" on any failure.
+func (b *Bot) backfillDescribeImage(ctx context.Context, evt *event.Event) string {
+	if b.llmVision == nil {
+		return ""
+	}
+
+	content := evt.Content.AsMessage()
+	mediaURL := content.URL
+	if mediaURL == "" {
+		return ""
+	}
+
+	resolvedURL, err := mediaURL.Parse()
+	if err != nil {
+		return ""
+	}
+
+	resp, err := b.mautrixClient.Download(ctx, resolvedURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	imageBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	description, err := b.describeImage(ctx, imageBytes, resp.Header.Get("Content-Type"))
+	if err != nil {
+		return ""
+	}
+
+	return description
 }
 
 // hasMention reports whether content contains mention at a word boundary.

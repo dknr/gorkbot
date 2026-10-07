@@ -66,6 +66,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Backfill.timeout != 24*time.Hour {
 		t.Errorf("expected default backfill timeout 24h, got %v", cfg.Backfill.timeout)
 	}
+	if cfg.Gork.Markdown == nil || !*cfg.Gork.Markdown {
+		t.Errorf("expected default markdown to be enabled, got %v", cfg.Gork.Markdown)
+	}
 }
 
 func TestLoadConfigFull(t *testing.T) {
@@ -121,6 +124,34 @@ func TestLoadConfigFull(t *testing.T) {
 	}
 	if cfg.Backfill.timeout != 3*time.Hour {
 		t.Errorf("expected backfill timeout 3h, got %v", cfg.Backfill.timeout)
+	}
+	if cfg.Gork.Markdown == nil || !*cfg.Gork.Markdown {
+		t.Errorf("expected markdown to be enabled by default, got %v", cfg.Gork.Markdown)
+	}
+}
+
+func TestLoadConfigMarkdownDisabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+
+	configData := `{
+		"homeserver": "https://matrix.example.org",
+		"user": "@gork:example.org",
+		"password": "secret",
+		"gork": {
+			"markdown": false
+		}
+	}`
+	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+	if cfg.Gork.Markdown == nil || *cfg.Gork.Markdown {
+		t.Errorf("expected markdown to be disabled, got %v", cfg.Gork.Markdown)
 	}
 }
 

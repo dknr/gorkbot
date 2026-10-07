@@ -17,10 +17,19 @@ type LLMConfig struct {
 	historyTimeout time.Duration
 }
 
+// LLMVisionConfig holds vision model (image-to-text) configuration.
+type LLMVisionConfig struct {
+	BaseURL     string `json:"base_url"`
+	APIKey      string `json:"api_key"`
+	Model       string `json:"model"`
+	ImagePrompt string `json:"image_prompt"`
+}
+
 // GorkConfig holds gork-specific configuration.
 type GorkConfig struct {
 	SystemPrompt string `json:"system_prompt"`
 	Mention      string `json:"mention"`
+	Markdown     *bool  `json:"markdown"`
 }
 
 // BackfillConfig controls how much room history is loaded into context on
@@ -34,16 +43,17 @@ type BackfillConfig struct {
 
 // Config holds the application configuration.
 type Config struct {
-	Homeserver  string        `json:"homeserver"`
-	User        string        `json:"user"`
-	Password    string        `json:"password"`
-	RecoveryKey string        `json:"recovery_key"`
-	Database    string        `json:"database"`
-	PickleKey   string        `json:"pickle_key"`
-	DeviceName  string        `json:"device_name"`
-	LLM         LLMConfig     `json:"llm"`
-	Gork        GorkConfig    `json:"gork"`
-	Backfill    BackfillConfig `json:"backfill"`
+	Homeserver  string          `json:"homeserver"`
+	User        string          `json:"user"`
+	Password    string          `json:"password"`
+	RecoveryKey string          `json:"recovery_key"`
+	Database    string          `json:"database"`
+	PickleKey   string          `json:"pickle_key"`
+	DeviceName  string          `json:"device_name"`
+	LLM         LLMConfig       `json:"llm"`
+	LLMVision   LLMVisionConfig `json:"llm_vision"`
+	Gork        GorkConfig      `json:"gork"`
+	Backfill    BackfillConfig  `json:"backfill"`
 }
 
 // LoadConfig reads the bot config from a JSON file, applying defaults for any
@@ -88,6 +98,24 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.LLM.historyTimeout = duration
 	if cfg.Gork.Mention == "" {
 		cfg.Gork.Mention = cfg.User
+	}
+	// Vision model defaults: disabled when base_url is empty.
+	if cfg.LLMVision.BaseURL == "" {
+		cfg.LLMVision.ImagePrompt = "Describe what you see in this image"
+	} else {
+		if cfg.LLMVision.Model == "" {
+			cfg.LLMVision.Model = "ggml-org/Qwen2-VL-2B-Instruct-GGUF"
+		}
+		if cfg.LLMVision.ImagePrompt == "" {
+			cfg.LLMVision.ImagePrompt = "Describe what you see in this image"
+		}
+	}
+	// Markdown formatting defaults to enabled. A bool pointer lets an explicit
+	// "markdown": false opt out, since an omitted field is otherwise
+	// indistinguishable from false.
+	if cfg.Gork.Markdown == nil {
+		enabled := true
+		cfg.Gork.Markdown = &enabled
 	}
 	if cfg.Backfill.MaxMessages == 0 {
 		cfg.Backfill.MaxMessages = 50

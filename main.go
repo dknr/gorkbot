@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,9 +28,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	log := zerolog.New(zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
+	logFile, err := os.OpenFile("gorkbot.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open log file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Write to both console and file.
+	consoleWriter := zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
 		w.TimeFormat = time.StampMilli
-	})).With().Timestamp().Logger().Level(zerolog.InfoLevel)
+	})
+	multiWriter := io.MultiWriter(consoleWriter, logFile)
+
+	log := zerolog.New(multiWriter).With().Timestamp().Logger().Level(zerolog.DebugLevel)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -54,10 +65,26 @@ func main() {
 		cfg.Gork.SystemPrompt,
 	)
 
-	gorkBot := NewBot(log, cfg, llmClient, func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string) {
+	var llmVision *llm.Client
+	if cfg.LLMVision.BaseURL != "" {
+		llmVision = llm.NewClient(
+			cfg.LLMVision.BaseURL,
+			cfg.LLMVision.Model,
+			cfg.LLMVision.APIKey,
+			"Describe what you see in this image in detail",
+		)
+	}
+
+	gorkBot := NewBot(log, cfg, llmClient, llmVision, rageBot.Client(), func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string) {
 		content := &event.MessageEventContent{
 			MsgType: event.MsgText,
 			Body:    response,
+		}
+		// Render the LLM's markdown reply to Matrix's custom HTML format so
+		// bold, code blocks, headings, etc. display nicely in room.
+		if cfg.Gork.Markdown != nil && *cfg.Gork.Markdown {
+			content.Format = event.FormatHTML
+			content.FormattedBody = renderMarkdown(response)
 		}
 		// We don't have the original event here, so reply is sent without
 		// threading. The full conversation history is maintained in the LLM

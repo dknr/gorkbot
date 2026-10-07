@@ -90,6 +90,8 @@ contains credentials.
 - `llm.base_url` defaults to `http://localhost:8080`.
 - `llm.api_key` is optional; omit for unauthenticated endpoints.
 - `gork.mention` defaults to the bot's Matrix user ID.
+- `gork.markdown` defaults to `true`; set `false` to send plain-text replies without
+  markdown-rendered HTML formatting.
 
 ## Local development
 

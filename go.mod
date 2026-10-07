@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/dknr/ragecore v0.0.1
 	github.com/rs/zerolog v1.35.1
+	github.com/yuin/goldmark v1.8.6
 	golang.org/x/net v0.59.0
 	maunium.net/go/mautrix v0.31.0
 )
