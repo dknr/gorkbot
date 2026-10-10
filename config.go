@@ -26,6 +26,10 @@ type LLMVisionConfig struct {
 	APIKey      string `json:"api_key"`
 	Model       string `json:"model"`
 	ImagePrompt string `json:"image_prompt"`
+	// MaxTokens caps the description. Reasoning counts against this budget on
+	// ds4, which is why the vision client disables thinking; raise MaxTokens
+	// before re-enabling it.
+	MaxTokens int `json:"max_tokens"`
 }
 
 // GorkConfig holds gork-specific configuration.
@@ -124,6 +128,9 @@ func LoadConfig(path string, console bool) (*Config, error) {
 		}
 		if cfg.LLMVision.ImagePrompt == "" {
 			cfg.LLMVision.ImagePrompt = "Describe what you see in this image"
+		}
+		if cfg.LLMVision.MaxTokens == 0 {
+			cfg.LLMVision.MaxTokens = 800
 		}
 	}
 	// Markdown formatting defaults to enabled. A bool pointer lets an explicit

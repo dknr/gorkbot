@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"image"
+	"image/color"
+	"image/gif"
+	"image/png"
 	"testing"
 	"time"
 
@@ -30,12 +35,12 @@ func newImageBot(t *testing.T, downloads map[string]downloadResult) *imageBot {
 	llmFake := &testutil.Client{Response: "llm reply"}
 	repliesCh := make(chan string, 16)
 	b := &Bot{
-		log:         zerolog.Nop(),
-		mention:     "@gork:example.org",
-		maxHistory:  10,
+		log:            zerolog.Nop(),
+		mention:        "@gork:example.org",
+		maxHistory:     10,
 		historyTimeout: time.Minute,
-		historyMgr: NewRoomHistoryManager(),
-		completeFn: llmFake.Complete,
+		historyMgr:     NewRoomHistoryManager(),
+		completeFn:     llmFake.Complete,
 		replyFn: func(_ context.Context, _ id.RoomID, _ id.EventID, response string) {
 			select {
 			case repliesCh <- response:
@@ -55,6 +60,58 @@ func newImageBot(t *testing.T, downloads map[string]downloadResult) *imageBot {
 const fakeImg = "mxc://example.org/img123"
 
 var fakeImageBytes = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3}
+
+// fakeGIFBytes encodes a 2x1 GIF: opaque blue, then a fully transparent
+// palette entry. That transparency is what the GIF-to-PNG path exists to
+// resolve, so the bytes are real rather than a magic-byte stub.
+func fakeGIFBytes(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewPaletted(image.Rect(0, 0, 2, 1), color.Palette{
+		color.NRGBA{R: 0, G: 0, B: 255, A: 255},
+		color.NRGBA{R: 255, G: 0, B: 0, A: 0},
+	})
+	img.SetColorIndex(0, 0, 0)
+	img.SetColorIndex(1, 0, 1)
+	var buf bytes.Buffer
+	if err := gif.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("encode GIF: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestPrepareImageGIFBecomesPNGOverWhite(t *testing.T) {
+	out, ct, err := prepareImage(fakeGIFBytes(t))
+	if err != nil {
+		t.Fatalf("prepareImage(GIF) error: %v", err)
+	}
+	if ct != "image/png" {
+		t.Errorf("expected GIF to be declared image/png, got %q", ct)
+	}
+	img, err := png.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode re-encoded PNG: %v", err)
+	}
+	if b := img.Bounds(); b.Dx() != 2 || b.Dy() != 1 {
+		t.Fatalf("expected a 2x1 image, got %dx%d", b.Dx(), b.Dy())
+	}
+	for _, tc := range []struct {
+		x    int
+		want [4]uint8
+	}{
+		{0, [4]uint8{0, 0, 255, 255}},
+		// The transparent index must land on white, not on whatever RGB the
+		// GIF happened to store under it.
+		{1, [4]uint8{255, 255, 255, 255}},
+	} {
+		// Compared as components because the PNG decoder hands back whichever
+		// concrete image type the header implies.
+		r, g, b, a := img.At(tc.x, 0).RGBA()
+		got := [4]uint8{uint8(r >> 8), uint8(g >> 8), uint8(b >> 8), uint8(a >> 8)}
+		if got != tc.want {
+			t.Errorf("pixel %d: expected %+v, got %+v", tc.x, tc.want, got)
+		}
+	}
+}
 
 func TestHandleImageNoVision(t *testing.T) {
 	b := newTestBot(t, &testutil.Client{}, nil, nil)
@@ -201,8 +258,9 @@ func TestHandleImageVisionError(t *testing.T) {
 func TestDescribeImage(t *testing.T) {
 	ib := newImageBot(t, nil)
 
-	// The http content type is passed through to the vision model.
-	desc, err := ib.bot.describeImage(context.Background(), []byte("bytes"), "image/png")
+	// The media type is sniffed from the bytes rather than trusted from the
+	// HTTP header.
+	desc, err := ib.bot.describeImage(context.Background(), fakeImageBytes)
 	if err != nil {
 		t.Fatalf("describeImage error: %v", err)
 	}
@@ -213,16 +271,18 @@ func TestDescribeImage(t *testing.T) {
 		t.Errorf("expected mime image/png, got %q", ib.vision.VisionMime)
 	}
 
-	// Empty content type is passed through as-is (the llama.cpp client
-	// normalizes non-image types to image/jpeg).
-	if _, err := ib.bot.describeImage(context.Background(), []byte("bytes"), ""); err != nil {
-		t.Fatalf("describeImage error: %v", err)
+	// A GIF reaches the model as PNG.
+	if _, err := ib.bot.describeImage(context.Background(), fakeGIFBytes(t)); err != nil {
+		t.Fatalf("describeImage(GIF) error: %v", err)
+	}
+	if ib.vision.VisionMime != "image/png" {
+		t.Errorf("expected GIF to arrive as image/png, got %q", ib.vision.VisionMime)
 	}
 
 	// Error propagation.
 	ib.vision.Err = testutil.ErrFake
-	if _, err := ib.bot.describeImage(context.Background(), []byte("bytes"), "image/png"); err != testutil.ErrFake {
-		t.Errorf("expected ErrFake, got %v", err)
+	if _, err := ib.bot.describeImage(context.Background(), fakeImageBytes); err != testutil.ErrFake {
+		t.Errorf("expected ErrFake, got: %v", err)
 	}
 }
 

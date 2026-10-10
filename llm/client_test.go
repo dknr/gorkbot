@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -117,6 +118,9 @@ func TestCompleteNon200(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "502") {
 		t.Errorf("expected error to mention status code 502, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "bad gateway") {
+		t.Errorf("expected error to include the response body, got: %v", err)
 	}
 }
 
@@ -270,6 +274,78 @@ func TestCompleteMultimodalHappyPath(t *testing.T) {
 	}
 	if pt != 5 || ct != 7 || tt != 12 {
 		t.Errorf("expected usage (5, 7, 12), got (%d, %d, %d)", pt, ct, tt)
+	}
+}
+
+func TestCompleteMultimodalOmitsSystemPromptWhenEmpty(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatRequestMultimodal
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		if len(req.Messages) != 1 {
+			t.Fatalf("expected only the user message, got %d", len(req.Messages))
+		}
+		if req.Messages[0].Role != "user" {
+			t.Errorf("expected the user message first, got %s", req.Messages[0].Role)
+		}
+		if req.Think == nil || *req.Think {
+			t.Errorf("expected think=false, got %v", req.Think)
+		}
+		if req.MaxTokens != 200 {
+			t.Errorf("expected max_tokens 200, got %d", req.MaxTokens)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Choices: []Choice{{Message: Message{Content: "a frog"}}}})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "qwen3.8-flash-next", "", "")
+	think := false
+	c.Think = &think
+	c.MaxTokens = 200
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QUJD", "image/png", "describe it"); err != nil {
+		t.Fatalf("CompleteMultimodal() error: %v", err)
+	}
+}
+
+func TestCompleteMultimodalOmitsUnsetControls(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := new(bytes.Buffer)
+		if _, err := body.ReadFrom(r.Body); err != nil {
+			t.Fatalf("failed to read request: %v", err)
+		}
+		for _, want := range []string{"\"think\"", "\"max_tokens\""} {
+			if strings.Contains(body.String(), want) {
+				t.Errorf("expected %s to be omitted, got %s", want, body.String())
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ChatResponse{Choices: []Choice{{Message: Message{Content: "ok"}}}})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "sys")
+	if _, _, _, _, err := c.CompleteMultimodal(context.Background(), "QUJD", "image/png", "describe it"); err != nil {
+		t.Fatalf("CompleteMultimodal() error: %v", err)
+	}
+}
+
+func TestCompleteMultimodalErrorIncludesBody(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":{"message":"image input requires starting ds4-server with --vision FILE"}}`)
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, "vision-model", "", "")
+	_, _, _, _, err := c.CompleteMultimodal(context.Background(), "QUJD", "image/png", "describe it")
+	if err == nil {
+		t.Fatal("expected error for 400 status, got nil")
+	}
+	if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "--vision") {
+		t.Errorf("expected status code and the server reason, got: %v", err)
 	}
 }
 

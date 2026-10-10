@@ -69,8 +69,14 @@ func main() {
 			cfg.LLMVision.BaseURL,
 			cfg.LLMVision.Model,
 			cfg.LLMVision.APIKey,
-			"Describe what you see in this image in detail",
+			// No system prompt: the per-image prompt already states the task.
+			"",
 		)
+		// ds4 counts reasoning against max_tokens, so a thinking reply can
+		// return an empty content field. Captions do not need reasoning.
+		noThinking := false
+		llmVision.Think = &noThinking
+		llmVision.MaxTokens = cfg.LLMVision.MaxTokens
 	}
 
 	rageBot, err := ragecore.New(ctx, &ragecore.Config{

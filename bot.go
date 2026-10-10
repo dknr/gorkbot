@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/gif"
+	"image/png"
 	"io"
 	"net/http"
 	"strings"
@@ -305,9 +310,9 @@ func (b *Bot) handleImage(ctx context.Context, evt *event.Event) {
 		Int("image_bytes", len(imageBytes)).
 		Msg("Read image data")
 
-	description, err := b.describeImage(ctx, imageBytes, resp.Header.Get("Content-Type"))
+	description, err := b.describeImage(ctx, imageBytes)
 	if err != nil {
-		log.Error().Err(err).Msg("Vision model failed")
+		log.Error().Err(err).Msg("Failed to describe image")
 		return
 	}
 
@@ -342,7 +347,45 @@ func (b *Bot) visionUnavailable() bool {
 	return b.visionComplete == nil && b.llmVision == nil
 }
 
-func (b *Bot) describeImage(ctx context.Context, imageBytes []byte, httpContentType string) (string, error) {
+// prepareImage converts downloaded media into a format the vision server
+// accepts, returning the bytes and the media type to declare. Matrix hands
+// back whatever the sender uploaded, while ds4 decodes only JPEG and PNG and
+// matches the data-URI media type literally.
+//
+// The type is sniffed from the bytes rather than trusted from the HTTP header:
+// homeservers have been known to send "image/jpeg; charset=binary" or a type
+// that disagrees with the payload.
+//
+// GIF becomes PNG, not JPEG. PNG keeps every opaque pixel exact, and the
+// transparent index is resolved onto white here instead of leaving the server
+// to read the RGB of pixels that carry no color. The frame is flattened to
+// NRGBA before encoding so the server never has to handle a paletted PNG with
+// a tRNS chunk. Animated GIFs contribute their first frame; motion is not
+// something a still description can carry.
+func prepareImage(data []byte) ([]byte, string, error) {
+	switch ct := http.DetectContentType(data); ct {
+	case "image/jpeg", "image/png":
+		return data, ct, nil
+	case "image/gif":
+		frame, err := gif.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, "", fmt.Errorf("decode GIF: %w", err)
+		}
+		bounds := frame.Bounds()
+		flat := image.NewNRGBA(bounds)
+		draw.Draw(flat, bounds, image.White, image.Point{}, draw.Src)
+		draw.Draw(flat, bounds, frame, bounds.Min, draw.Over)
+		var out bytes.Buffer
+		if err := png.Encode(&out, flat); err != nil {
+			return nil, "", fmt.Errorf("re-encode GIF as PNG: %w", err)
+		}
+		return out.Bytes(), "image/png", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported image type %q", ct)
+	}
+}
+
+func (b *Bot) describeImage(ctx context.Context, imageBytes []byte) (string, error) {
 	complete := b.visionComplete
 	if complete == nil && b.llmVision != nil {
 		complete = b.llmVision.CompleteMultimodal
@@ -350,11 +393,11 @@ func (b *Bot) describeImage(ctx context.Context, imageBytes []byte, httpContentT
 	if complete == nil {
 		return "", errors.New("no vision model configured")
 	}
-	mimeType := "image/jpeg"
-	if httpContentType != "" {
-		mimeType = httpContentType
+	imageData, mimeType, err := prepareImage(imageBytes)
+	if err != nil {
+		return "", err
 	}
-	imageBase64 := base64.StdEncoding.EncodeToString(imageBytes)
+	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 	desc, _, _, _, err := complete(ctx, imageBase64, mimeType, b.imagePrompt)
 	return desc, err
 }
@@ -695,7 +738,7 @@ func (b *Bot) backfillDescribeImage(ctx context.Context, evt *event.Event) strin
 		return ""
 	}
 
-	description, err := b.describeImage(ctx, imageBytes, resp.Header.Get("Content-Type"))
+	description, err := b.describeImage(ctx, imageBytes)
 	if err != nil {
 		return ""
 	}

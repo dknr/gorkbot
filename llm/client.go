@@ -5,9 +5,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
+
+// errorBodyLimit caps how much of a failed response body is kept, so a
+// server-side HTML error page cannot flood the log.
+const errorBodyLimit = 512
+
+// responseError reports a non-200 response. Providers put the actual reason
+// (unknown endpoint, missing vision encoder, unsupported image) in the body
+// rather than the status code, so a snippet of it goes into the error.
+func responseError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
+	snippet := strings.TrimSpace(string(body))
+	if snippet == "" {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return fmt.Errorf("unexpected status code: %d: %s", resp.StatusCode, snippet)
+}
 
 // Client is an LLM client for the llama.cpp API.
 type Client struct {
@@ -16,6 +33,16 @@ type Client struct {
 	APIKey       string
 	SystemPrompt string
 	HTTPClient   *http.Client
+
+	// Think turns model-side reasoning on or off on the multimodal path.
+	// nil omits the field and leaves the server default in place. Reasoning
+	// counts against MaxTokens, so enabling it without raising that budget
+	// can leave no room for the visible answer.
+	Think *bool
+
+	// MaxTokens caps generated tokens. It is only sent on the multimodal
+	// path; zero omits the field and uses the server default.
+	MaxTokens int
 }
 
 // NewClient creates a new LLM client.
@@ -55,9 +82,12 @@ type ChatRequest struct {
 }
 
 // ChatRequestMultimodal is the request body for multimodal chat completions.
+// Think and MaxTokens are ds4 extensions; both are omitted when unset.
 type ChatRequestMultimodal struct {
-	Model    string                  `json:"model"`
-	Messages []ChatMessageMultimodal `json:"messages"`
+	Model     string                  `json:"model"`
+	Messages  []ChatMessageMultimodal `json:"messages"`
+	Think     *bool                   `json:"think,omitempty"`
+	MaxTokens int                     `json:"max_tokens,omitempty"`
 }
 
 // ChatMessageMultimodal represents a message that can contain both text and image content parts.
@@ -103,28 +133,31 @@ func (c *Client) CompleteMultimodal(ctx context.Context, imageBase64, mimeType, 
 		mimeTypePrefix = mimeType
 	}
 
-	messages := []ChatMessageMultimodal{
-		{
-			Role: "system",
-			Content: []ChatMessageContent{
-				{Type: "text", Text: c.SystemPrompt},
-			},
-		},
-		{
-			Role: "user",
-			Content: []ChatMessageContent{
-				{
-					Type:     "image_url",
-					ImageURL: &ImageURL{URL: "data:" + mimeTypePrefix + ";base64," + imageBase64},
-				},
-				{Type: "text", Text: textPrompt},
-			},
-		},
+	// The image prompt already states what is wanted, so a system message is
+	// only sent when the caller configured one.
+	messages := make([]ChatMessageMultimodal, 0, 2)
+	if c.SystemPrompt != "" {
+		messages = append(messages, ChatMessageMultimodal{
+			Role:    "system",
+			Content: []ChatMessageContent{{Type: "text", Text: c.SystemPrompt}},
+		})
 	}
+	messages = append(messages, ChatMessageMultimodal{
+		Role: "user",
+		Content: []ChatMessageContent{
+			{
+				Type:     "image_url",
+				ImageURL: &ImageURL{URL: "data:" + mimeTypePrefix + ";base64," + imageBase64},
+			},
+			{Type: "text", Text: textPrompt},
+		},
+	})
 
 	req := ChatRequestMultimodal{
-		Model:    c.Model,
-		Messages: messages,
+		Model:     c.Model,
+		Messages:  messages,
+		Think:     c.Think,
+		MaxTokens: c.MaxTokens,
 	}
 
 	body, err := json.Marshal(req)
@@ -150,7 +183,7 @@ func (c *Client) CompleteMultimodal(ctx context.Context, imageBase64, mimeType, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, 0, 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return "", 0, 0, 0, responseError(resp)
 	}
 
 	var chatResp ChatResponse
@@ -211,7 +244,7 @@ func (c *Client) Complete(ctx context.Context, history []ChatMessage) (string, i
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, 0, 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return "", 0, 0, 0, responseError(resp)
 	}
 
 	var chatResp ChatResponse

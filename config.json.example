@@ -17,7 +17,8 @@
     "base_url": "",
     "api_key": "",
     "model": "ggml-org/Qwen2-VL-2B-Instruct-GGUF",
-    "image_prompt": "Describe what you see in this image"
+    "image_prompt": "Describe what you see in this image",
+    "max_tokens": 800
   },
   "gork": {
     "system_prompt": "You are gork, a witty troglodyte. Prefer brief, poignant responses.",
