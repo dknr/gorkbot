@@ -19,9 +19,8 @@ Or manually: `go build -tags goolm -o gorkbot .` (`goolm` avoids the `libolm`
 cgo dependency).
 
 This project depends on
-[ragecore](https://github.com/dknr/ragecore). The `replace` directive in
-`go.mod` expects ragecore to be checked out as a sibling directory
-(`../ragecore`); adjust it if your layout differs.
+[ragecore](https://github.com/dknr/ragecore), pulled from GitHub as a regular
+module dependency pinned by tag in `go.mod`.
 
 ## Deploy
 

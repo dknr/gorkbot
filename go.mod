@@ -3,7 +3,7 @@ module gorkbot
 go 1.27.0
 
 require (
-	github.com/dknr/ragecore v0.0.1
+	github.com/dknr/ragecore v1.0.0
 	github.com/rs/zerolog v1.35.1
 	github.com/yuin/goldmark v1.8.6
 	golang.org/x/net v0.59.0
@@ -26,5 +26,3 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 )
-
-replace github.com/dknr/ragecore => ../ragecore
