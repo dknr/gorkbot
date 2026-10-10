@@ -29,51 +29,55 @@ const workerQueueSize = 100
 
 // Bot represents the gork chatbot.
 type Bot struct {
-	log            zerolog.Logger
-	mention        string
-	llmClient      *llm.Client
-	llmVision      *llm.Client
-	visionComplete func(ctx context.Context, imageBase64, mimeType, textPrompt string) (string, int, int, int, error)
-	imagePrompt    string
-	maxHistory     int
-	historyTimeout time.Duration
-	historyMgr     *RoomHistoryManager
-	mautrixClient  *mautrix.Client
-	joinedRoomsFn  func(ctx context.Context) (*mautrix.RespJoinedRooms, error)
-	messagesFn     func(ctx context.Context, roomID id.RoomID, from string, limit int) (*mautrix.RespMessages, error)
-	downloadFn     func(ctx context.Context, mxcURL id.ContentURI) (*http.Response, error)
-	selfID         id.UserID
-	workerCh       chan message
-	workerDone     chan struct{}
-	replyFn        func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
-	typingFn       func(ctx context.Context, roomID id.RoomID, typing bool)
-	backfillMax    int
-	backfillWindow time.Duration
-	stopCh         chan struct{}
-	completeFn     func(ctx context.Context, history []llm.ChatMessage) (string, int, int, int, error)
+	log             zerolog.Logger
+	mention         string
+	llmClient       *llm.Client
+	llmVision       *llm.Client
+	visionComplete  func(ctx context.Context, imageBase64, mimeType, textPrompt string) (string, int, int, int, error)
+	imagePrompt     string
+	maxHistory      int
+	historyTimeout  time.Duration
+	historyMgr      *RoomHistoryManager
+	mautrixClient   *mautrix.Client
+	joinedRoomsFn   func(ctx context.Context) (*mautrix.RespJoinedRooms, error)
+	joinRoomFn      func(ctx context.Context, roomID id.RoomID) error
+	allowedInviters map[id.UserID]struct{}
+	messagesFn      func(ctx context.Context, roomID id.RoomID, from string, limit int) (*mautrix.RespMessages, error)
+	downloadFn      func(ctx context.Context, mxcURL id.ContentURI) (*http.Response, error)
+	selfID          id.UserID
+	workerCh        chan message
+	workerDone      chan struct{}
+	replyFn         func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string)
+	typingFn        func(ctx context.Context, roomID id.RoomID, typing bool)
+	backfillMax     int
+	backfillWindow  time.Duration
+	stopCh          chan struct{}
+	completeFn      func(ctx context.Context, history []llm.ChatMessage) (string, int, int, int, error)
 }
 
 // NewBot creates a Bot from a config and LLM client. The sendReply function
 // is used to send the bot's reply to Matrix; it must not be nil. The
 // setTyping function, if non-nil, is used to show a typing indicator while
 // waiting on the LLM provider. If llmVision is nil, image events are silently
-// ignored. The mautrixClient is used for downloading images from Matrix.
+// ignored. The mautrixClient is used for downloading images from Matrix and
+// for joining rooms when a whitelisted user invites the bot.
 func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, llmVision *llm.Client, mautrixClient *mautrix.Client, sendReply func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string), setTyping func(ctx context.Context, roomID id.RoomID, typing bool)) *Bot {
 	return &Bot{
-		log:            log,
-		mention:        config.Gork.Mention,
-		llmClient:      llmClient,
-		llmVision:      llmVision,
-		imagePrompt:    config.LLMVision.ImagePrompt,
-		mautrixClient:  mautrixClient,
-		maxHistory:     config.LLM.MaxHistory,
-		historyTimeout: config.LLM.historyTimeout,
-		historyMgr:     NewRoomHistoryManager(),
-		replyFn:        sendReply,
-		typingFn:       setTyping,
-		backfillMax:    config.Backfill.MaxMessages,
-		backfillWindow: config.Backfill.timeout,
-		stopCh:         make(chan struct{}),
+		log:             log,
+		mention:         config.Gork.Mention,
+		llmClient:       llmClient,
+		llmVision:       llmVision,
+		imagePrompt:     config.LLMVision.ImagePrompt,
+		mautrixClient:   mautrixClient,
+		maxHistory:      config.LLM.MaxHistory,
+		historyTimeout:  config.LLM.historyTimeout,
+		historyMgr:      NewRoomHistoryManager(),
+		replyFn:         sendReply,
+		typingFn:        setTyping,
+		backfillMax:     config.Backfill.MaxMessages,
+		backfillWindow:  config.Backfill.timeout,
+		allowedInviters: config.Invite.allowedInviters,
+		stopCh:          make(chan struct{}),
 	}
 }
 
@@ -162,6 +166,53 @@ func (b *Bot) Handler() func(ctx context.Context, evt *event.Event) {
 			// Worker queue full; drop the message.
 		}
 	}
+}
+
+// HandleInvite reacts to room invites: gork joins the room when the invite was
+// sent by a whitelisted user, and ignores every other invite. Register it with
+// OnEvent, not OnMessage: invites arrive as m.room.member state events, so
+// non-member events and non-invite membership changes fall through untouched.
+func (b *Bot) HandleInvite(ctx context.Context, evt *event.Event) {
+	if evt.Type.Type != event.StateMember.Type || evt.StateKey == nil {
+		return
+	}
+	if evt.Content.AsMember().Membership != event.MembershipInvite {
+		return
+	}
+	// The state key names the invited user; the inviter is the event sender.
+	invitee := id.UserID(*evt.StateKey)
+	if invitee != b.selfID {
+		return
+	}
+	log := b.log.With().
+		Str("room_id", evt.RoomID.String()).
+		Str("inviter", evt.Sender.String()).
+		Str("invitee", invitee.String()).
+		Logger()
+	if !b.inviterAllowed(evt.Sender) {
+		log.Info().Msg("Ignoring invite from sender not on the invite whitelist")
+		return
+	}
+	if err := b.joinRoom(ctx, evt.RoomID); err != nil {
+		log.Error().Err(err).Msg("Failed to join room after whitelisted invite")
+		return
+	}
+	log.Info().Msg("Joined room on invite from whitelisted sender")
+}
+
+// inviterAllowed reports whether a user is on the invite whitelist. An empty
+// whitelist means gork never auto-joins.
+func (b *Bot) inviterAllowed(user id.UserID) bool {
+	_, ok := b.allowedInviters[user]
+	return ok
+}
+
+func (b *Bot) joinRoom(ctx context.Context, roomID id.RoomID) error {
+	if b.joinRoomFn != nil {
+		return b.joinRoomFn(ctx, roomID)
+	}
+	_, err := b.mautrixClient.JoinRoomByID(ctx, roomID)
+	return err
 }
 
 func (b *Bot) joinedRooms(ctx context.Context) (*mautrix.RespJoinedRooms, error) {

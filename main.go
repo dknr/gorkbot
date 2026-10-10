@@ -112,6 +112,9 @@ func main() {
 	})
 
 	rageBot.OnMessage(gorkBot.Handler())
+	// Invites are m.room.member state events, so they need the catch-all hook;
+	// gork only joins when the inviter is on the configured whitelist.
+	rageBot.OnEvent(gorkBot.HandleInvite)
 
 	log.Info().Msg("Gork is running")
 	gorkBot.selfID = rageBot.Client().UserID

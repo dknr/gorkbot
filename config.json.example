@@ -24,6 +24,9 @@
     "mention": "@gork:example.org",
     "markdown": true
   },
+  "invite": {
+    "allowed_inviters": ["@you:example.org"]
+  },
   "backfill": {
     "max_messages": 50,
     "timeout": "24h"

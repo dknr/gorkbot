@@ -8,6 +8,7 @@ responds to @mentions with chat completions from an LLM.
 - Maintains per-room conversation history (max messages + inactivity timeout).
 - Uses ragecore for login, E2EE crypto, and device verification.
 - Worker queue serializes LLM calls so history stays consistent.
+- Auto-joins rooms when the invite comes from a whitelisted user.
 
 ## Build
 
@@ -78,6 +79,9 @@ contains credentials.
   "gork": {
     "system_prompt": "You are gork, a gruff and terse LLM agent. Respond succinctly.",
     "mention": "@gork:example.org"
+  },
+  "invite": {
+    "allowed_inviters": ["@you:example.org"]
   }
 }
 ```
@@ -91,6 +95,11 @@ contains credentials.
 - `gork.mention` defaults to the bot's Matrix user ID.
 - `gork.markdown` defaults to `true`; set `false` to send plain-text replies without
   markdown-rendered HTML formatting.
+- `invite.allowed_inviters` is a list of Matrix user IDs. When one of them
+  invites gork to a room, gork joins automatically. The list is empty by
+  default, so **gork never auto-joins** unless you configure it. Matching is
+  exact on the full user ID (`@name:server`); everyone else's invites are
+  ignored, and invites are only acted on when they are addressed to gork.
 
 ## Local development
 

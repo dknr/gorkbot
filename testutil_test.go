@@ -61,6 +61,16 @@ func memberEvent(t *testing.T, sender id.UserID, ts int64) *event.Event {
 	return msgEvent(t, sender, event.NewEventType("m.room.member"), map[string]any{"membership": "join"}, ts)
 }
 
+// inviteEvent builds an m.room.member invite for invitee, sent by inviter.
+// The Matrix spec carries no inviter field: the inviter is the event sender
+// and the invitee is the state key.
+func inviteEvent(t *testing.T, inviter, invitee id.UserID, ts int64) *event.Event {
+	stateKey := invitee.String()
+	evt := msgEvent(t, inviter, event.StateMember, map[string]any{"membership": "invite"}, ts)
+	evt.StateKey = &stateKey
+	return evt
+}
+
 // imageEvent builds an m.image message pointing at mxcURL, optionally with an
 // encrypted file attachment.
 func imageEvent(t *testing.T, sender id.UserID, mxcURL string, file *event.EncryptedFileInfo, ts int64) *event.Event {

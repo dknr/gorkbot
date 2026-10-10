@@ -265,3 +265,71 @@ func TestLoadConfigConsoleMode(t *testing.T) {
 		t.Errorf("expected empty mention in console mode, got %q", cfg.Gork.Mention)
 	}
 }
+
+// writeConfig writes config JSON to a temp file and returns its path.
+func writeConfig(t *testing.T, configData string) string {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return configPath
+}
+
+func TestLoadConfigInviteWhitelistDefaultsEmpty(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"homeserver": "https://matrix.example.org",
+		"user": "@gork:example.org",
+		"password": "secret"
+	}`)
+
+	cfg, err := LoadConfig(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+	if len(cfg.Invite.allowedInviters) != 0 {
+		t.Errorf("expected empty invite whitelist by default, got %v", cfg.Invite.allowedInviters)
+	}
+}
+
+func TestLoadConfigInviteWhitelist(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"homeserver": "https://matrix.example.org",
+		"user": "@gork:example.org",
+		"password": "secret",
+		"invite": {
+			"allowed_inviters": ["@alice:example.org", " @bob:example.org "]
+		}
+	}`)
+
+	cfg, err := LoadConfig(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+	b := &Bot{allowedInviters: cfg.Invite.allowedInviters}
+	if !b.inviterAllowed("@alice:example.org") {
+		t.Errorf("expected @alice:example.org to be whitelisted")
+	}
+	// Surrounding whitespace in the config must not break matching.
+	if !b.inviterAllowed("@bob:example.org") {
+		t.Errorf("expected @bob:example.org to be whitelisted")
+	}
+	if b.inviterAllowed("@mallory:example.org") {
+		t.Errorf("expected @mallory:example.org not to be whitelisted")
+	}
+}
+
+func TestLoadConfigInviteWhitelistRejectsInvalidID(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"homeserver": "https://matrix.example.org",
+		"user": "@gork:example.org",
+		"password": "secret",
+		"invite": {
+			"allowed_inviters": ["alice:example.org"]
+		}
+	}`)
+
+	if _, err := LoadConfig(configPath, false); err == nil {
+		t.Fatal("expected error for malformed allowed_inviters entry, got nil")
+	}
+}

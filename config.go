@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
+
+	"maunium.net/go/mautrix/id"
 )
 
 // LLMConfig holds LLM provider configuration.
@@ -41,6 +44,15 @@ type BackfillConfig struct {
 	timeout     time.Duration
 }
 
+// InviteConfig controls how the bot reacts to room invites. Gork only joins a
+// room automatically when the invite was sent by a user listed in
+// AllowedInviters; an empty whitelist means invites are never acted on.
+// Matching is exact on full Matrix user IDs.
+type InviteConfig struct {
+	AllowedInviters []string `json:"allowed_inviters"`
+	allowedInviters map[id.UserID]struct{}
+}
+
 // Config holds the application configuration.
 type Config struct {
 	Homeserver  string          `json:"homeserver"`
@@ -54,6 +66,7 @@ type Config struct {
 	LLMVision   LLMVisionConfig `json:"llm_vision"`
 	Gork        GorkConfig      `json:"gork"`
 	Backfill    BackfillConfig  `json:"backfill"`
+	Invite      InviteConfig    `json:"invite"`
 }
 
 // LoadConfig reads the bot config from a JSON file, applying defaults for any
@@ -131,5 +144,15 @@ func LoadConfig(path string, console bool) (*Config, error) {
 		return nil, fmt.Errorf("invalid backfill timeout %q: %w", cfg.Backfill.Timeout, err)
 	}
 	cfg.Backfill.timeout = backfillDuration
+	// Invite whitelist: entries are validated up front so a typo is a startup
+	// error instead of an entry that silently never matches.
+	cfg.Invite.allowedInviters = make(map[id.UserID]struct{}, len(cfg.Invite.AllowedInviters))
+	for _, raw := range cfg.Invite.AllowedInviters {
+		inviter := id.UserID(strings.TrimSpace(raw))
+		if _, _, err := inviter.Parse(); err != nil {
+			return nil, fmt.Errorf("invalid invite.allowed_inviters entry %q: %w", raw, err)
+		}
+		cfg.Invite.allowedInviters[inviter] = struct{}{}
+	}
 	return &cfg, nil
 }
