@@ -58,6 +58,16 @@ type Bot struct {
 	backfillWindow  time.Duration
 	stopCh          chan struct{}
 	completeFn      func(ctx context.Context, history []llm.ChatMessage) (string, int, int, int, error)
+
+	// Image generation (the draw_image tool). sd is nil when image generation is
+	// disabled, which also keeps the tool away from the model.
+	image         ImageConfig
+	sd            *sdClient
+	completeTools func(ctx context.Context, history []llm.ChatMessageTool, tools []llm.Tool, toolChoice any,
+		temperature float64, maxTokens int) (llm.ToolMessage, llm.UsageInfo, error)
+	drawImage   func(ctx context.Context, prompt string) ([]byte, error)
+	uploadFn    func(ctx context.Context, data []byte, name string) (id.ContentURI, error)
+	sendImageFn func(ctx context.Context, roomID id.RoomID, uri id.ContentURI, caption string, png []byte) error
 }
 
 // NewBot creates a Bot from a config and LLM client. The sendReply function
@@ -67,7 +77,7 @@ type Bot struct {
 // ignored. The mautrixClient is used for downloading images from Matrix and
 // for joining rooms when a whitelisted user invites the bot.
 func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, llmVision *llm.Client, mautrixClient *mautrix.Client, sendReply func(ctx context.Context, roomID id.RoomID, eventID id.EventID, response string), setTyping func(ctx context.Context, roomID id.RoomID, typing bool)) *Bot {
-	return &Bot{
+	bot := &Bot{
 		log:             log,
 		mention:         config.Gork.Mention,
 		llmClient:       llmClient,
@@ -84,6 +94,28 @@ func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, llmVision
 		allowedInviters: config.Invite.allowedInviters,
 		stopCh:          make(chan struct{}),
 	}
+	if config.Image.enabled() {
+		bot.image = config.Image
+		bot.sd = &sdClient{
+			BaseURL:  config.Image.BaseURL,
+			Width:    config.Image.Width,
+			Height:   config.Image.Height,
+			Steps:    config.Image.Steps,
+			CFGScale: config.Image.CFGScale,
+			Timeout:  config.Image.timeout,
+		}
+		bot.drawImage = func(ctx context.Context, prompt string) ([]byte, error) {
+			return bot.sd.generate(ctx, prompt, config.Image.NegativePrompt)
+		}
+	}
+	return bot
+}
+
+// toolsEnabled reports whether the draw_image tool should be offered. Drawing
+// needs both the diffusion server and the vision model, because the model
+// cannot judge a picture it cannot see.
+func (b *Bot) toolsEnabled() bool {
+	return b.sd != nil && !b.visionUnavailable()
 }
 
 // RoomHistoryManager manages per-room conversation histories.
@@ -452,14 +484,38 @@ func (b *Bot) handle(msg message) {
 		Str("prompt", prompt).
 		Msg("Mention detected")
 
-	// Create a 2-minute timeout context for the LLM call.
-	ctx, cancel := context.WithTimeout(msg.ctx, 2*time.Minute)
+	// Create a timeout context for the LLM call. When drawing is enabled the
+	// budget has to cover the diffusion calls too: worst case is one image plus
+	// MaxRetries redraws, each capped by the image server timeout, on top of the
+	// model turns around them.
+	timeout := 2 * time.Minute
+	if b.toolsEnabled() {
+		timeout = time.Duration(b.image.maxRetries+1)*b.image.timeout + 2*time.Minute
+	}
+	ctx, cancel := context.WithTimeout(msg.ctx, timeout)
 	defer cancel()
 
 	// Show a typing indicator while waiting on the LLM provider.
 	if b.typingFn != nil {
 		b.typingFn(msg.ctx, msg.roomID, true)
 		defer b.typingFn(msg.ctx, msg.roomID, false)
+	}
+
+	if b.toolsEnabled() {
+		outcome, ok := b.runToolLoop(ctx, msg, hm, b.log)
+		if ok {
+			if outcome.ReplyText != "" {
+				hm.AddMessage(llm.ChatMessage{Role: "assistant", Content: outcome.ReplyText})
+				b.replyFn(msg.ctx, msg.roomID, msg.eventID, outcome.ReplyText)
+			}
+			b.log.Info().
+				Str("room_id", msg.roomID.String()).
+				Int("drawn", outcome.Drawn).
+				Bool("sent", outcome.Sent).
+				Msg("Tool loop finished")
+			return
+		}
+		b.log.Warn().Str("room_id", msg.roomID.String()).Msg("Tool loop failed, falling back to plain reply")
 	}
 
 	var response string

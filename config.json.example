@@ -18,7 +18,7 @@
     "api_key": "",
     "model": "ggml-org/Qwen2-VL-2B-Instruct-GGUF",
     "image_prompt": "Describe what you see in this image",
-    "max_tokens": 800
+    "max_tokens": 1600
   },
   "gork": {
     "system_prompt": "You are gork, a witty troglodyte. Prefer brief, poignant responses.",
@@ -31,5 +31,15 @@
   "backfill": {
     "max_messages": 50,
     "timeout": "24h"
+  },
+  "image": {
+    "base_url": "http://localhost:8001",
+    "width": 512,
+    "height": 512,
+    "steps": 20,
+    "cfg_scale": 7,
+    "negative_prompt": "text, watermark, blurry",
+    "timeout": "2m",
+    "max_retries": 2
   }
 }

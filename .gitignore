@@ -19,3 +19,6 @@ deps/
 
 # Review notes
 REVIEW.md
+
+# Integration test output (drawn images)
+integration-draws/

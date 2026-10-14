@@ -119,6 +119,143 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+// Tool is an OpenAI-style tool definition as accepted by llama.cpp's server.
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction describes one callable tool.
+type ToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// ToolCall is a function call requested by the model.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+// FunctionCall carries the tool name and its JSON-encoded arguments.
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ChatMessageTool is a chat message that may carry tool calls or a tool
+// result. Content is a plain string because llama.cpp's tool templates do not
+// accept structured content parts on the tool path.
+// Content is always serialized, even when empty: llama.cpp rejects any
+// non-assistant message that omits the field entirely, which happens for the
+// tool-result turn when a description comes back blank.
+type ChatMessageTool struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// ChatRequestTools is the request body for the tool-calling chat endpoint.
+// Tools and ToolChoice are omitted when unset: dropping Tools entirely is what
+// makes a tool-calling model stop calling and answer, see CompleteTools.
+type ChatRequestTools struct {
+	Model       string            `json:"model"`
+	Messages    []ChatMessageTool `json:"messages"`
+	Tools       []Tool            `json:"tools,omitempty"`
+	ToolChoice  any               `json:"tool_choice,omitempty"`
+	MaxTokens   int               `json:"max_tokens,omitempty"`
+	Temperature *float64          `json:"temperature,omitempty"`
+}
+
+// ToolMessage is the assistant or tool turn on the tool path.
+type ToolMessage struct {
+	Content      string     `json:"content"`
+	ToolCalls    []ToolCall `json:"tool_calls"`
+	FinishReason string     `json:"finish_reason"`
+}
+
+type toolsChoice struct {
+	Message ToolMessage `json:"message"`
+}
+
+type toolsResponse struct {
+	Choices []toolsChoice `json:"choices"`
+	Usage   UsageInfo     `json:"usage"`
+}
+
+// CompleteTools sends history to the model with tool support. When tools is
+// non-empty the model may answer with tool calls; when tools is empty and
+// toolChoice is "none" the server is told to answer in plain text.
+//
+// llama.cpp's Llama 3.2 build has no native tool template, so the server
+// bolts on a PEG parser. Observed behavior that shapes this API: with tools
+// offered on a turn that already contains a tool result the model re-issues
+// the same call indefinitely and never reads the result, so callers must drop
+// Tools (and set tool_choice "none") once the tool budget is spent to get a
+// terminating answer. Emitting a second tool call in one turn hard-fails the
+// server with HTTP 500, so callers must treat tools as one-per-turn.
+func (c *Client) CompleteTools(ctx context.Context, history []ChatMessageTool, tools []Tool, toolChoice any, temperature float64, maxTokens int) (ToolMessage, UsageInfo, error) {
+	if c.HTTPClient == nil {
+		c.HTTPClient = &http.Client{}
+	}
+
+	url := fmt.Sprintf("%s/chat/completions", c.BaseURL)
+
+	messages := make([]ChatMessageTool, 0, len(history)+1)
+	if c.SystemPrompt != "" {
+		messages = append(messages, ChatMessageTool{Role: "system", Content: c.SystemPrompt})
+	}
+	messages = append(messages, history...)
+
+	temp := temperature
+	req := ChatRequestTools{
+		Model:       c.Model,
+		Messages:    messages,
+		Tools:       tools,
+		ToolChoice:  toolChoice,
+		MaxTokens:   maxTokens,
+		Temperature: &temp,
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return ToolMessage{}, UsageInfo{}, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return ToolMessage{}, UsageInfo{}, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return ToolMessage{}, UsageInfo{}, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ToolMessage{}, UsageInfo{}, responseError(resp)
+	}
+
+	var parsed toolsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return ToolMessage{}, UsageInfo{}, fmt.Errorf("decode response: %w", err)
+	}
+	if len(parsed.Choices) == 0 {
+		return ToolMessage{}, UsageInfo{}, fmt.Errorf("no choices in response")
+	}
+	msg := parsed.Choices[0].Message
+	msg.Content = strings.TrimLeft(msg.Content, " \t\n\r")
+	return msg, parsed.Usage, nil
+}
+
 // CompleteMultimodal sends an image and text prompt to a multimodal model and
 // returns the generated text plus token usage.
 func (c *Client) CompleteMultimodal(ctx context.Context, imageBase64, mimeType, textPrompt string) (string, int, int, int, error) {

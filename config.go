@@ -32,6 +32,30 @@ type LLMVisionConfig struct {
 	MaxTokens int `json:"max_tokens"`
 }
 
+// ImageConfig holds the image generation ("hands") configuration: a
+// stable-diffusion.cpp server exposing the A1111-compatible txt2img API. When
+// BaseURL is empty the draw_image tool is not offered to the model at all and
+// the bot behaves as it did before this feature existed.
+type ImageConfig struct {
+	BaseURL        string  `json:"base_url"`
+	Width          int     `json:"width"`
+	Height         int     `json:"height"`
+	Steps          int     `json:"steps"`
+	CFGScale       float64 `json:"cfg_scale"`
+	NegativePrompt string  `json:"negative_prompt"`
+	Timeout        string  `json:"timeout"`
+	// MaxRetries caps redraws after the first image. A pointer distinguishes an
+	// explicit 0 (never redraw, always send the first result) from an omitted
+	// field, which defaults to 2.
+	MaxRetries *int `json:"max_retries"`
+
+	maxRetries int
+	timeout    time.Duration
+}
+
+// enabled reports whether image generation is configured.
+func (i ImageConfig) enabled() bool { return strings.TrimSpace(i.BaseURL) != "" }
+
 // GorkConfig holds gork-specific configuration.
 type GorkConfig struct {
 	SystemPrompt string `json:"system_prompt"`
@@ -68,6 +92,7 @@ type Config struct {
 	DeviceName  string          `json:"device_name"`
 	LLM         LLMConfig       `json:"llm"`
 	LLMVision   LLMVisionConfig `json:"llm_vision"`
+	Image       ImageConfig     `json:"image"`
 	Gork        GorkConfig      `json:"gork"`
 	Backfill    BackfillConfig  `json:"backfill"`
 	Invite      InviteConfig    `json:"invite"`
@@ -130,9 +155,38 @@ func LoadConfig(path string, console bool) (*Config, error) {
 			cfg.LLMVision.ImagePrompt = "Describe what you see in this image"
 		}
 		if cfg.LLMVision.MaxTokens == 0 {
-			cfg.LLMVision.MaxTokens = 800
+			cfg.LLMVision.MaxTokens = 1600
 		}
 	}
+	// Image generation defaults: disabled when base_url is empty.
+	if cfg.Image.MaxRetries == nil {
+		retries := 2
+		cfg.Image.MaxRetries = &retries
+	}
+	if *cfg.Image.MaxRetries < 0 {
+		return nil, fmt.Errorf("image.max_retries must be 0 or greater, got %d", *cfg.Image.MaxRetries)
+	}
+	cfg.Image.maxRetries = *cfg.Image.MaxRetries
+	if cfg.Image.Width <= 0 {
+		cfg.Image.Width = 512
+	}
+	if cfg.Image.Height <= 0 {
+		cfg.Image.Height = 512
+	}
+	if cfg.Image.Steps <= 0 {
+		cfg.Image.Steps = 20
+	}
+	if cfg.Image.CFGScale <= 0 {
+		cfg.Image.CFGScale = 7
+	}
+	if cfg.Image.Timeout == "" {
+		cfg.Image.Timeout = "2m"
+	}
+	imageTimeout, err := time.ParseDuration(cfg.Image.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid image.timeout %q: %w", cfg.Image.Timeout, err)
+	}
+	cfg.Image.timeout = imageTimeout
 	// Markdown formatting defaults to enabled. A bool pointer lets an explicit
 	// "markdown": false opt out, since an omitted field is otherwise
 	// indistinguishable from false.
