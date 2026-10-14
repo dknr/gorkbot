@@ -151,6 +151,18 @@ the running server:
 - Descriptions are echoed back as a *user* message, not only as a tool result,
   because tool-result content is ignored while tools are still offered.
 
+Images in an encrypted room are encrypted client-side and sent in the event's
+`file` field with the mxc inside it, the way every other Matrix client does;
+plaintext rooms get a plain `url`. `filename` is always set to `gork.png`
+because clients name the saved download from `filename` then `body`, and a
+missing extension makes their next upload come back as
+`application/octet-stream`.
+
+**Known unresolved issue:** users on a different homeserver still cannot view
+these images, while the local homeserver renders them fine. Encryption, the
+event shape and the file bytes have all been checked and the cause is unknown;
+media federation between the two homeservers is the untested suspect.
+
 Verify the whole path against live servers:
 
 ```sh

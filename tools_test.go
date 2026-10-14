@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -58,12 +61,13 @@ func textMsg(content string) llm.ToolMessage {
 // drawBot is a Bot wired with fakes for the LLM tool path, the diffusion
 // server, the vision model, the media upload and the image send.
 type drawBot struct {
-	bot     *Bot
-	hm      *HistoryManager
-	send    *[]string // captions of images that reached the room
-	drawn   *[]string // prompts sent to the diffusion server
-	uploads *int
-	turns   *[]toolTurn
+	bot       *Bot
+	hm        *HistoryManager
+	send      *[]string // captions of images that reached the room
+	drawn     *[]string // prompts sent to the diffusion server
+	uploads   *int
+	turns     *[]toolTurn
+	encrypted *[]bool
 }
 
 // toolTurn records what the model was offered on each call, so tests can
@@ -80,6 +84,7 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 	var drawList []string
 	var sendList []string
 	uploads := 0
+	var uploadEncrypted []bool
 	// visionErr is nil; captions are consumed one per generated image.
 	captionIdx := 0
 
@@ -133,24 +138,37 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 	}
 	b.imagePrompt = "Describe what you see in this image"
 
-	b.uploadFn = func(_ context.Context, data []byte, _ string) (id.ContentURI, error) {
+	b.uploadFn = func(_ context.Context, data []byte, _ string, encrypt bool) (id.ContentURI, *event.EncryptedFileInfo, error) {
 		mu.Lock()
 		defer mu.Unlock()
+		uploadEncrypted = append(uploadEncrypted, encrypt)
 		if !bytes.Equal(data, testPNG) {
-			return id.ContentURI{}, errors.New("uploaded bytes are not the generated image")
+			return id.ContentURI{}, nil, errors.New("uploaded bytes are not the generated image")
 		}
 		uploads++
-		return mustContentURI(t, "mxc://example.org/abc"), nil
+		uri := mustContentURI(t, "mxc://example.org/abc")
+		if encrypt {
+			// Mirrors the real path: the mxc moves into the file object and the
+			// plain url comes back empty.
+			return id.ContentURI{}, &event.EncryptedFileInfo{
+				EncryptedFile: *attachment.NewEncryptedFile(),
+				URL:           id.ContentURIString(uri.String()),
+			}, nil
+		}
+		return uri, nil, nil
 	}
 
-	b.sendImageFn = func(_ context.Context, room id.RoomID, uri id.ContentURI, caption string, pngBytes []byte) error {
+	b.sendImageFn = func(_ context.Context, room id.RoomID, uri id.ContentURI, file *event.EncryptedFileInfo, caption string, pngBytes []byte) error {
 		mu.Lock()
 		defer mu.Unlock()
 		if room != testRoom {
 			return errors.New("image sent to wrong room")
 		}
-		if uri.String() == "" {
+		if uri.String() == "" && (file == nil || file.URL == "") {
 			return errors.New("image sent without a media URI")
+		}
+		if uri.String() != "" && file != nil {
+			return errors.New("image sent with both a plain url and an encrypted file")
 		}
 		if len(pngBytes) == 0 {
 			return errors.New("image sent without image bytes")
@@ -160,7 +178,9 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 	}
 
 	hm := b.historyMgr.GetOrCreate(testRoom, 50, time.Minute)
-	return &drawBot{bot: b, hm: hm, send: &sendList, drawn: &drawList, uploads: &uploads, turns: &turnList}
+	d := &drawBot{bot: b, hm: hm, send: &sendList, drawn: &drawList, uploads: &uploads, turns: &turnList}
+	d.encrypted = &uploadEncrypted
+	return d
 }
 
 func drawMessage() message {
@@ -385,21 +405,166 @@ func TestToolsDisabledWithoutVision(t *testing.T) {
 	}
 }
 
-func TestSendImageEventShape(t *testing.T) {
-	var sent any
-	b := &Bot{mautrixClient: nil, sendImageFn: func(_ context.Context, _ id.RoomID, _ id.ContentURI, caption string, _ []byte) error {
-		sent = caption
-		return nil
-	}}
-	if err := b.sendImage(context.Background(), testRoom, mustContentURI(t, "mxc://example.org/abc"), "a cube", testPNG); err != nil {
+func TestMediaEncryptedDefaultsToEncrypted(t *testing.T) {
+	// No state store to ask: nothing can say "not encrypted", so it is.
+	b := &Bot{mautrixClient: &mautrix.Client{}}
+	if !b.mediaEncrypted(context.Background(), testRoom) {
+		t.Fatal("a room with no state store must be treated as encrypted")
+	}
+}
+
+func TestUploadImageEncryptsByDefault(t *testing.T) {
+	var gotBody []byte
+	var gotQuery string
+	var gotType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		gotType = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"content_uri":"mxc://example.org/enc1"}`)
+	}))
+	defer srv.Close()
+
+	cli, err := mautrix.NewClient(srv.URL, "@gork:example.org", "token")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if sent != "a cube" {
-		t.Fatalf("caption = %v", sent)
+	b := &Bot{mautrixClient: cli}
+
+	uri, file, err := b.uploadImage(context.Background(), testPNG, "gork.png", true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The event type must be m.image for clients to render it as media.
-	if event.MsgImage != "m.image" {
-		t.Fatal("unexpected msgtype constant")
+	if file == nil {
+		t.Fatal("encrypted upload must return file info")
+	}
+	if uri.String() != "" {
+		t.Fatalf("encrypted upload must not return a plain url, got %s", uri)
+	}
+	if string(file.URL) != "mxc://example.org/enc1" {
+		t.Fatalf("file.url = %q", file.URL)
+	}
+	if bytes.Equal(gotBody, testPNG) {
+		t.Fatal("plaintext bytes were uploaded to an encrypted room")
+	}
+	if len(gotBody) != len(testPNG) {
+		t.Fatalf("ciphertext length %d != plaintext %d", len(gotBody), len(testPNG))
+	}
+	if gotType != "application/octet-stream" {
+		t.Fatalf("encrypted upload content type = %q", gotType)
+	}
+	if strings.Contains(gotQuery, "filename") {
+		t.Fatalf("encrypted upload leaked a filename: %q", gotQuery)
+	}
+	if file.Version != "v2" || file.Key.Algorithm != "A256CTR" || file.InitVector == "" || file.Hashes.SHA256 == "" {
+		t.Fatalf("incomplete encrypted file info: %+v", file)
+	}
+	// Decrypt from a JSON round-trip, the way a real client does: mautrix caches
+	// decoded key material on the struct that encrypted, and that cache does not
+	// carry the ciphertext hash, so reusing the same value to decrypt always
+	// fails with a hash mismatch.
+	wire, err := json.Marshal(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fresh event.EncryptedFileInfo
+	if err := json.Unmarshal(wire, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	clear, err := fresh.Decrypt(gotBody)
+	if err != nil {
+		t.Fatalf("decrypting what was uploaded: %v (%s)", err, wire)
+	}
+	if !bytes.Equal(clear, testPNG) {
+		t.Fatal("uploaded ciphertext does not decrypt back to the generated image")
+	}
+}
+
+func TestUploadImagePlaintextWhenRoomIsNotEncrypted(t *testing.T) {
+	var gotBody []byte
+	var gotType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotType = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"content_uri":"mxc://example.org/plain1"}`)
+	}))
+	defer srv.Close()
+
+	cli, err := mautrix.NewClient(srv.URL, "@gork:example.org", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri, file, err := (&Bot{mautrixClient: cli}).uploadImage(context.Background(), testPNG, "gork.png", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file != nil {
+		t.Fatal("plaintext upload must not return file info")
+	}
+	if uri.String() != "mxc://example.org/plain1" {
+		t.Fatalf("uri = %s", uri)
+	}
+	if !bytes.Equal(gotBody, testPNG) {
+		t.Fatal("plaintext upload altered the bytes")
+	}
+	if gotType != "image/png" {
+		t.Fatalf("content type = %q", gotType)
+	}
+}
+
+func TestSendImagePutsEncryptedMediaInFileField(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"event_id":"$1"}`)
+	}))
+	defer srv.Close()
+	cli, err := mautrix.NewClient(srv.URL, "@gork:example.org", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Bot{mautrixClient: cli}
+	room := id.RoomID("!room:example.org")
+
+	file := &event.EncryptedFileInfo{
+		EncryptedFile: *attachment.NewEncryptedFile(),
+		URL:           "mxc://example.org/enc1",
+	}
+	if err := b.sendImage(context.Background(), room, id.ContentURI{}, file, "a cube", testPNG); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["url"]; ok {
+		t.Fatalf("encrypted image must not carry a plain url: %v", body["url"])
+	}
+	f, ok := body["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("encrypted image has no file object: %v", body)
+	}
+	if f["url"] != "mxc://example.org/enc1" || f["v"] != "v2" {
+		t.Fatalf("bad file object: %v", f)
+	}
+	if body["msgtype"] != "m.image" {
+		t.Fatalf("msgtype = %v", body["msgtype"])
+	}
+	// info still describes the plaintext image, not the ciphertext.
+	info, ok := body["info"].(map[string]any)
+	if !ok || info["mimetype"] != "image/png" || info["w"] != float64(3) || info["h"] != float64(2) {
+		t.Fatalf("bad info: %v", body["info"])
+	}
+
+	// And the plaintext path puts it in url instead.
+	body = nil
+	if err := b.sendImage(context.Background(), room, mustContentURI(t, "mxc://example.org/plain1"), nil, "a cube", testPNG); err != nil {
+		t.Fatal(err)
+	}
+	if body["url"] != "mxc://example.org/plain1" {
+		t.Fatalf("plaintext url = %v", body["url"])
+	}
+	if _, ok := body["file"]; ok {
+		t.Fatal("plaintext image must not carry a file object")
 	}
 }
 

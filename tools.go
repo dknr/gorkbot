@@ -15,6 +15,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -437,10 +438,11 @@ func userTurn(sender, content string) llm.ChatMessageTool {
 	return llm.ChatMessageTool{Role: "user", Content: sender + ": " + content}
 }
 
-// publishImage uploads the PNG, sends it to the room, and follows up with the
-// model's caption text when there is any.
+// publishImage encrypts when the room needs it, uploads, and sends the
+// m.image event with whichever field the room's encryption calls for.
 func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, drawPrompt, replyText string) error {
-	uri, err := b.uploadImage(ctx, png, "gork.png")
+	encrypt := b.mediaEncrypted(ctx, msg.roomID)
+	uri, file, err := b.uploadImage(ctx, png, "gork.png", encrypt)
 	if err != nil {
 		return fmt.Errorf("upload image: %w", err)
 	}
@@ -448,48 +450,104 @@ func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, drawPro
 	if caption == "" {
 		caption = drawPrompt
 	}
-	if err := b.sendImage(ctx, msg.roomID, uri, caption, png); err != nil {
+	if err := b.sendImage(ctx, msg.roomID, uri, file, caption, png); err != nil {
 		return fmt.Errorf("send image: %w", err)
 	}
 	return nil
 }
 
-// uploadImage uploads PNG bytes to the homeserver media repo.
-func (b *Bot) uploadImage(ctx context.Context, data []byte, name string) (id.ContentURI, error) {
-	if b.uploadFn != nil {
-		return b.uploadFn(ctx, data, name)
+// mediaEncrypted reports whether media for this room must be uploaded
+// encrypted. The answer defaults to yes: a plaintext upload in an encrypted
+// room is invisible to everyone who is not on the homeserver that holds the
+// media, while an encrypted upload in a plaintext room still renders for
+// clients that read the file field. Only a state store that positively answers
+// "not encrypted" downgrades to a plain url.
+func (b *Bot) mediaEncrypted(ctx context.Context, roomID id.RoomID) bool {
+	if b.mediaEncryptedFn != nil {
+		return b.mediaEncryptedFn(ctx, roomID)
 	}
 	if b.mautrixClient == nil {
-		return id.ContentURI{}, errors.New("no homeserver client configured")
+		return false
 	}
-	resp, err := b.mautrixClient.UploadMedia(ctx, mautrix.ReqUploadMedia{
-		ContentBytes: data,
-		FileName:     name,
+	store, ok := b.mautrixClient.StateStore.(interface {
+		IsEncrypted(context.Context, id.RoomID) (bool, error)
 	})
-	if err != nil {
-		return id.ContentURI{}, err
+	if !ok {
+		return true
 	}
-	return resp.ContentURI, nil
+	encrypted, err := store.IsEncrypted(ctx, roomID)
+	if err != nil {
+		return true
+	}
+	return encrypted
 }
 
-// sendImage sends an m.image event to a room. Width and height are read from
-// the PNG so clients can reserve layout space before the media loads.
-func (b *Bot) sendImage(ctx context.Context, roomID id.RoomID, uri id.ContentURI, caption string, png []byte) error {
+// uploadImage puts the PNG in the homeserver media repo.
+//
+// In an encrypted room the bytes are encrypted client-side first and uploaded
+// as application/octet-stream with no filename, exactly as the spec and every
+// other Matrix client do; the returned EncryptedFileInfo carries the key, IV
+// and ciphertext hash that go into the event's "file" field, and the plain URL
+// comes back empty so it cannot be put in the event by mistake.
+func (b *Bot) uploadImage(ctx context.Context, data []byte, name string, encrypt bool) (id.ContentURI, *event.EncryptedFileInfo, error) {
+	if b.uploadFn != nil {
+		return b.uploadFn(ctx, data, name, encrypt)
+	}
+	if b.mautrixClient == nil {
+		return id.ContentURI{}, nil, errors.New("no homeserver client configured")
+	}
+	body := data
+	contentType := "image/png"
+	fileName := name
+	var file *event.EncryptedFileInfo
+	if encrypt {
+		file = &event.EncryptedFileInfo{EncryptedFile: *attachment.NewEncryptedFile()}
+		body = file.Encrypt(data)
+		contentType = "application/octet-stream"
+		fileName = ""
+	}
+	resp, err := b.mautrixClient.UploadMedia(ctx, mautrix.ReqUploadMedia{
+		ContentBytes: body,
+		FileName:     fileName,
+		ContentType:  contentType,
+	})
+	if err != nil {
+		return id.ContentURI{}, nil, err
+	}
+	if file != nil {
+		// The mxc belongs inside the file object; the event must not also carry
+		// a plain url.
+		file.URL = id.ContentURIString(resp.ContentURI.String())
+		return id.ContentURI{}, file, nil
+	}
+	return resp.ContentURI, nil, nil
+}
+
+// sendImage sends an m.image event to a room. Encrypted media goes in "file"
+// with the plaintext mime type and size still described in "info"; plaintext
+// media goes in "url". Width and height are read from the PNG so clients can
+// reserve layout space before the media loads.
+func (b *Bot) sendImage(ctx context.Context, roomID id.RoomID, uri id.ContentURI, file *event.EncryptedFileInfo, caption string, png []byte) error {
 	if b.sendImageFn != nil {
-		return b.sendImageFn(ctx, roomID, uri, caption, png)
+		return b.sendImageFn(ctx, roomID, uri, file, caption, png)
 	}
 	if b.mautrixClient == nil {
 		return errors.New("no homeserver client configured")
 	}
-	info := &event.FileInfo{MimeType: "image/png"}
+	info := &event.FileInfo{MimeType: "image/png", Size: len(png)}
 	if w, h, err := pngSize(png); err == nil {
 		info.Width, info.Height = w, h
 	}
 	content := &event.MessageEventContent{
-		MsgType: event.MsgImage,
-		Body:    caption,
-		URL:     id.ContentURIString(uri.String()),
-		Info:    info,
+		MsgType:  event.MsgImage,
+		Body:     caption,
+		FileName: "gork.png",
+		Info:     info,
+	}
+	if file != nil {
+		content.File = file
+	} else {
+		content.URL = id.ContentURIString(uri.String())
 	}
 	_, err := b.mautrixClient.SendMessageEvent(ctx, roomID, event.EventMessage, content)
 	return err

@@ -66,8 +66,10 @@ type Bot struct {
 	completeTools func(ctx context.Context, history []llm.ChatMessageTool, tools []llm.Tool, toolChoice any,
 		temperature float64, maxTokens int) (llm.ToolMessage, llm.UsageInfo, error)
 	drawImage   func(ctx context.Context, prompt string) ([]byte, error)
-	uploadFn    func(ctx context.Context, data []byte, name string) (id.ContentURI, error)
-	sendImageFn func(ctx context.Context, roomID id.RoomID, uri id.ContentURI, caption string, png []byte) error
+	uploadFn    func(ctx context.Context, data []byte, name string, encrypt bool) (id.ContentURI, *event.EncryptedFileInfo, error)
+	sendImageFn func(ctx context.Context, roomID id.RoomID, uri id.ContentURI, file *event.EncryptedFileInfo, caption string, png []byte) error
+	// mediaEncryptedFn overrides the room encryption check (test seam).
+	mediaEncryptedFn func(ctx context.Context, roomID id.RoomID) bool
 }
 
 // NewBot creates a Bot from a config and LLM client. The sendReply function

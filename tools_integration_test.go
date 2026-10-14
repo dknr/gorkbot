@@ -11,13 +11,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/crypto/attachment"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"gorkbot/llm"
@@ -35,6 +41,7 @@ func TestIntegrationDrawLoop(t *testing.T) {
 	visionURL := intEnv("GORK_VISION_URL", "http://192.168.1.2:8000/v1")
 	sdURL := intEnv("GORK_SD_URL", "http://localhost:8001")
 	outDir := intEnv("GORK_DRAW_DIR", "integration-draws")
+	encryptUpload := true
 	promptBaked := intEnv("GORK_PROMPT", "draw me a purple cat wearing a top hat and reading a newspaper")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -62,19 +69,53 @@ func TestIntegrationDrawLoop(t *testing.T) {
 
 	var sent []string
 	n := 0
-	bot.uploadFn = func(_ context.Context, data []byte, _ string) (id.ContentURI, error) {
+	bot.uploadFn = func(_ context.Context, data []byte, _ string, encrypt bool) (id.ContentURI, *event.EncryptedFileInfo, error) {
 		n++
-		path := filepath.Join(outDir, "attempt-"+time.Now().Format("150405")+".png")
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			return id.ContentURI{}, err
+		// Save the plaintext so a human can compare it with the caption: what
+		// leaves the process is ciphertext when the room is encrypted.
+		plaintext := data
+		var file *event.EncryptedFileInfo
+		if encrypt {
+			file = &event.EncryptedFileInfo{EncryptedFile: *attachment.NewEncryptedFile()}
+			data = file.Encrypt(data)
+			wire, err := json.Marshal(file)
+			if err != nil {
+				return id.ContentURI{}, nil, err
+			}
+			var fresh event.EncryptedFileInfo
+			if err := json.Unmarshal(wire, &fresh); err != nil {
+				return id.ContentURI{}, nil, err
+			}
+			back, err := fresh.Decrypt(data)
+			if err != nil {
+				return id.ContentURI{}, nil, fmt.Errorf("uploaded ciphertext does not decrypt: %w", err)
+			}
+			if !bytes.Equal(back, plaintext) {
+				return id.ContentURI{}, nil, errors.New("encrypted round-trip changed the image")
+			}
 		}
-		sent = append(sent, path)
-		return id.MustParseContentURI("mxc://local/" + path), nil
+		path := filepath.Join(outDir, "attempt-"+time.Now().Format("150405")+".png")
+		if err := os.WriteFile(path, plaintext, 0o644); err != nil {
+			return id.ContentURI{}, nil, err
+		}
+		sent = append(sent, fmt.Sprintf("%s (encrypted=%t, %d bytes on the wire)", path, encrypt, len(data)))
+		if file != nil {
+			return id.ContentURI{}, file, nil
+		}
+		return id.MustParseContentURI("mxc://local/" + path), nil, nil
 	}
+	// The real bot asks the state store; here there is no homeserver client, so
+	// force the encrypted path, which is what the reported bug was about.
+	bot.mediaEncryptedFn = func(context.Context, id.RoomID) bool { return encryptUpload }
+
 	var delivered []string
-	bot.sendImageFn = func(_ context.Context, _ id.RoomID, uri id.ContentURI, caption string, pngBytes []byte) error {
+	bot.sendImageFn = func(_ context.Context, _ id.RoomID, uri id.ContentURI, file *event.EncryptedFileInfo, caption string, pngBytes []byte) error {
 		delivered = append(delivered, caption)
-		t.Logf("IMAGE DELIVERED uri=%s bytes=%d caption=%q", uri, len(pngBytes), caption)
+		if file != nil {
+			t.Logf("IMAGE DELIVERED encrypted file=%s key=%s... bytes=%d caption=%q", file.URL, file.Key.Key[:8], len(pngBytes), caption)
+		} else {
+			t.Logf("IMAGE DELIVERED plaintext uri=%s bytes=%d caption=%q", uri, len(pngBytes), caption)
+		}
 		return nil
 	}
 
