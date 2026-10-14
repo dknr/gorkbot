@@ -450,10 +450,31 @@ func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, drawPro
 	if caption == "" {
 		caption = drawPrompt
 	}
+	// Log where the bytes actually landed. The mxc plus the encryption flag is
+	// everything needed to re-fetch the media through the authenticated and the
+	// legacy endpoints and see which one a remote homeserver gets an answer from.
+	b.log.Info().
+		Str("mxc", mediaRef(uri, file)).
+		Bool("encrypted", file != nil).
+		Int64("bytes", int64(len(png))).
+		Msg("Image uploaded")
 	if err := b.sendImage(ctx, msg.roomID, uri, file, caption, png); err != nil {
 		return fmt.Errorf("send image: %w", err)
 	}
 	return nil
+}
+
+// mediaRef returns the mxc URI of an uploaded image whichever field it ended up
+// in: the plain url for a plaintext room, or the url nested inside the encrypted
+// file object otherwise.
+func mediaRef(uri id.ContentURI, file *event.EncryptedFileInfo) string {
+	if file != nil {
+		return string(file.URL)
+	}
+	if uri.String() == "" {
+		return ""
+	}
+	return uri.String()
 }
 
 // mediaEncrypted reports whether media for this room must be uploaded
