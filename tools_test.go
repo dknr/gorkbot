@@ -116,14 +116,14 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 		return reply, llm.UsageInfo{}, nil
 	}
 
-	b.drawImage = func(_ context.Context, prompt string) ([]byte, error) {
+	b.drawImage = func(_ context.Context, prompt string) ([]byte, string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		drawList = append(drawList, prompt)
 		if drawErr != nil {
-			return nil, drawErr
+			return nil, "", drawErr
 		}
-		return testPNG, nil
+		return testPNG, `{"steps":8,"cfg_scale":1,"loras":[{"path":"/models/lora/turbo.safetensors"}]}`, nil
 	}
 
 	b.visionComplete = func(_ context.Context, _, _, _ string) (string, int, int, int, error) {
@@ -352,12 +352,15 @@ func TestSDClientGenerateDecodesPNG(t *testing.T) {
 	defer srv.Close()
 
 	sd := &sdClient{BaseURL: srv.URL, Width: 512, Height: 512, Steps: 12, CFGScale: 7, Timeout: time.Minute}
-	data, err := sd.generate(context.Background(), "a red cube", "")
+	data, info, err := sd.generate(context.Background(), "a red cube")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(data, testPNG) {
 		t.Fatal("returned bytes do not match the served image")
+	}
+	if info == "" {
+		t.Fatal("the server's info echo was dropped")
 	}
 	if w, h, err := pngSize(data); err != nil || w != 3 || h != 2 {
 		t.Fatalf("pngSize = %d,%d,%v", w, h, err)
@@ -366,7 +369,7 @@ func TestSDClientGenerateDecodesPNG(t *testing.T) {
 
 func TestSDClientGenerateRejectsEmptyPrompt(t *testing.T) {
 	sd := &sdClient{BaseURL: "http://127.0.0.1:1"}
-	if _, err := sd.generate(context.Background(), "   ", ""); err == nil {
+	if _, _, err := sd.generate(context.Background(), "   "); err == nil {
 		t.Fatal("expected an error for an empty prompt")
 	}
 }
@@ -379,7 +382,7 @@ func TestImageConfigDefaults(t *testing.T) {
 	if cfg.Image.maxRetries != 2 {
 		t.Fatalf("max_retries default = %d, want 2", cfg.Image.maxRetries)
 	}
-	if cfg.Image.Width != 512 || cfg.Image.Height != 512 || cfg.Image.Steps != 20 || cfg.Image.CFGScale != 7 {
+	if cfg.Image.Width != 512 || cfg.Image.Height != 512 || cfg.Image.Steps != 8 || cfg.Image.CFGScale != 1 {
 		t.Fatalf("unexpected defaults: %+v", cfg.Image)
 	}
 	if cfg.Image.timeout != 2*time.Minute {
@@ -587,6 +590,9 @@ func loadTestConfig(t *testing.T, extra string) *Config {
 	t.Helper()
 	path := t.TempDir() + "/config.json"
 	extra = strings.TrimSpace(extra)
+	if extra != "" && !strings.HasPrefix(extra, "{") {
+		extra = "{" + extra + "}"
+	}
 	extra = strings.TrimSuffix(strings.TrimPrefix(extra, "{"), "}")
 	lead := ""
 	if extra != "" {
@@ -604,6 +610,9 @@ func loadTestConfig(t *testing.T, extra string) *Config {
 }
 
 // newSDTestServer stands in for stable-diffusion.cpp's txt2img endpoint.
+// sdCaptured holds the last txt2img body the fake server received.
+var sdCaptured = new(sdRequest)
+
 func newSDTestServer(t *testing.T, pngBytes []byte) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -615,6 +624,7 @@ func newSDTestServer(t *testing.T, pngBytes []byte) *httptest.Server {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("bad sd request: %v", err)
 		}
+		*sdCaptured = req
 		if req.Prompt == "" {
 			http.Error(w, "prompt is required", http.StatusBadRequest)
 			return
@@ -634,4 +644,204 @@ func mustContentURI(t *testing.T, raw string) id.ContentURI {
 		t.Fatal(err)
 	}
 	return uri
+}
+
+func TestGenerateSendsConfiguredStepsCFGAndLora(t *testing.T) {
+	srv := newSDTestServer(t, testPNG)
+	defer srv.Close()
+
+	sd := &sdClient{
+		BaseURL: srv.URL, Width: 1024, Height: 1024, Steps: 8, CFGScale: 1,
+		Lora:    []loraSpec{{Path: "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors", Multiplier: 1}},
+		Timeout: time.Minute,
+	}
+	if _, _, err := sd.generate(context.Background(), "a cube"); err != nil {
+		t.Fatal(err)
+	}
+	got := *sdCaptured
+	if got.Steps != 8 || got.CFGScale != 1 {
+		t.Fatalf("steps/cfg = %d/%v, want 8/1", got.Steps, got.CFGScale)
+	}
+	if got.NegativePrompt != "" {
+		t.Fatalf("negative prompt sent at CFG 1: %q", got.NegativePrompt)
+	}
+	if len(got.Lora) != 1 || got.Lora[0].Path != "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors" || got.Lora[0].Multiplier != 1 {
+		t.Fatalf("lora = %+v", got.Lora)
+	}
+	if got.Seed != -1 {
+		t.Fatalf("seed = %d, want -1 so redraws differ", got.Seed)
+	}
+	// The field must be absent, not an empty string, at CFG 1.
+	raw, _ := json.Marshal(got)
+	if strings.Contains(string(raw), "negative_prompt") {
+		t.Fatalf("empty negative prompt still serialized: %s", raw)
+	}
+}
+
+func TestParseLoraSpecs(t *testing.T) {
+	got, err := parseLoraSpecs([]string{
+		"qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors",
+		"tumblr_2.1_v3.safetensors:0.6",
+		"  spaced.safetensors  ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []loraSpec{
+		{Path: "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors", Multiplier: 1},
+		{Path: "tumblr_2.1_v3.safetensors", Multiplier: 0.6},
+		{Path: "spaced.safetensors", Multiplier: 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	for _, bad := range []string{"", "  ", ":0.5", "thing:0", "thing:2.5", "thing:notanumber:"} {
+		if _, err := parseLoraSpecs([]string{bad}); err == nil {
+			t.Fatalf("entry %q accepted, should not be", bad)
+		}
+	}
+	// A file name containing no colon keeps its multiplier at 1.
+	specs, err := parseLoraSpecs([]string{"a.b.c.safetensors"})
+	if err != nil || specs[0].Multiplier != 1 || specs[0].Path != "a.b.c.safetensors" {
+		t.Fatalf("got %+v, %v", specs, err)
+	}
+}
+
+func TestImageConfigTurboDefaults(t *testing.T) {
+	cfg := loadTestConfig(t, `{"image":{"base_url":"http://localhost:8001"}}`)
+	if cfg.Image.Steps != 8 || cfg.Image.CFGScale != 1 {
+		t.Fatalf("defaults = %d steps at CFG %v, want 8 at 1", cfg.Image.Steps, cfg.Image.CFGScale)
+	}
+	if cfg.Image.NegativePrompt != "" {
+		t.Fatalf("default negative prompt = %q", cfg.Image.NegativePrompt)
+	}
+	if len(cfg.Image.lora) != 0 {
+		t.Fatalf("no lora configured, got %+v", cfg.Image.lora)
+	}
+
+	cfg = loadTestConfig(t, `{"image":{"base_url":"http://localhost:8001","steps":8,"cfg_scale":1,`+
+		`"lora":["turbo.safetensors:0.8"]}}`)
+	if len(cfg.Image.lora) != 1 || cfg.Image.lora[0].Multiplier != 0.8 {
+		t.Fatalf("lora = %+v", cfg.Image.lora)
+	}
+}
+
+func TestImageConfigRejectsBadLora(t *testing.T) {
+	path := t.TempDir() + "/config.json"
+	body := `{"homeserver":"https://m","user":"@gork:x","password":"p",` +
+		`"image":{"base_url":"http://localhost:8001","lora":["turbo.safetensors:0"]}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path, true); err == nil {
+		t.Fatal("a zero multiplier must be a startup error, not a silently dropped adapter")
+	}
+}
+
+func TestSDInfoSummary(t *testing.T) {
+	got := sdInfoSummary(`{"steps":8,"cfg_scale":1.0,"loras":[{"path":"/models/lora/turbo.safetensors","multiplier":1}]}`)
+	if got != "steps=8 cfg=1 lora=turbo.safetensors" {
+		t.Fatalf("summary = %q", got)
+	}
+	// This build reports no loras field at all; the adapter must then be scraped
+	// from the inline form in infotexts, and never summarised as an empty list,
+	// which would read as "no adapter applied".
+	scraped := sdInfoSummary(`{"steps":8,"cfg_scale":1.0,"infotexts":["a cube <lora:/models/lora/turbo.safetensors:1.0>"]}`)
+	if scraped != "steps=8 cfg=1 lora=turbo.safetensors" {
+		t.Fatalf("scraped summary = %q", scraped)
+	}
+	quiet := sdInfoSummary(`{"steps":8,"cfg_scale":1.0}`)
+	if quiet != "steps=8 cfg=1 lora=not reported" {
+		t.Fatalf("quiet summary = %q", quiet)
+	}
+	if sdInfoSummary("") != "" {
+		t.Fatal("empty echo must summarise to empty")
+	}
+	// Not JSON: pass a truncated snippet through rather than losing it.
+	long := sdInfoSummary(strings.Repeat("x", 300))
+	if len(long) != 120 {
+		t.Fatalf("non-JSON echo was not truncated: %d chars", len(long))
+	}
+}
+
+func TestImageAltUsesTheVisionCaption(t *testing.T) {
+	caption := "The image shows a red cube on grass. It is rendered in a hyper-realistic " +
+		"style with dramatic lighting and a long tail of further observations that would " +
+		"scroll off the bottom of any client window."
+	got := imageAlt(caption, "a red cube on grass in a hyper realistic style")
+	if got != "The image shows a red cube on grass." {
+		t.Fatalf("alt = %q", got)
+	}
+}
+
+func TestImageAltFallsBackAndCaps(t *testing.T) {
+	if got := imageAlt("", "a purple cat"); got != "a purple cat" {
+		t.Fatalf("fallback alt = %q", got)
+	}
+	if got := imageAlt("", ""); got != "gork.png" {
+		t.Fatalf("empty alt = %q", got)
+	}
+	long := imageAlt(strings.Repeat("word ", 200), "")
+	if len([]rune(long)) > maxImageAlt+2 {
+		t.Fatalf("alt not capped: %d runes", len([]rune(long)))
+	}
+	if !strings.HasSuffix(long, "…") {
+		t.Fatalf("capped alt has no ellipsis: %q", long)
+	}
+}
+
+// The room must receive the model's reply exactly once: as the text message.
+// Putting it in the image body as well is what made the same sentence appear
+// twice under one picture.
+func TestToolLoopSendsReplyTextOnce(t *testing.T) {
+	d := newDrawBot(t, []llm.ToolMessage{
+		toolCallMsg("c1", toolDrawImage, `{"prompt":"a cube"}`),
+		textMsg("a cube, as commanded"),
+	}, []string{"a red cube on a hill, quite nice"}, nil)
+
+	out := d.run(t)
+	if out.ReplyText != "a cube, as commanded" {
+		t.Fatalf("reply = %q", out.ReplyText)
+	}
+	if len(*d.send) != 1 {
+		t.Fatalf("images sent = %d", len(*d.send))
+	}
+	if (*d.send)[0] == out.ReplyText {
+		t.Fatal("the reply text was also used as the image alt text; the room shows it twice")
+	}
+	// The caption has no sentence break, so it is used whole.
+	if (*d.send)[0] != "a red cube on a hill, quite nice" {
+		t.Fatalf("image alt = %q, want the vision caption", (*d.send)[0])
+	}
+}
+
+// Out of draws and still calling: the narration must not be relayed, because it
+// promises a redraw that will never come.
+func TestToolLoopReplacesNarrationAfterBudgetSpent(t *testing.T) {
+	narrate := llm.ToolMessage{
+		FinishReason: "tool_calls",
+		Content: "Since the image drawn does not match the user's request, I will call " +
+			"draw_image again with a corrected prompt.",
+		ToolCalls: []llm.ToolCall{{ID: "c1", Type: "function",
+			Function: llm.FunctionCall{Name: toolDrawImage, Arguments: `{"prompt":"cube"}`}}},
+	}
+	d := newDrawBot(t, []llm.ToolMessage{narrate, narrate, narrate, narrate},
+		[]string{"one.", "two.", "three."}, nil)
+
+	out := d.run(t)
+	if out.Drawn != 3 || !out.Sent {
+		t.Fatalf("drawn=%d sent=%v", out.Drawn, out.Sent)
+	}
+	if strings.Contains(out.ReplyText, "I will call") {
+		t.Fatalf("relayed the model's unfulfilled intention as a reply: %q", out.ReplyText)
+	}
+	if out.ReplyText != "three." {
+		t.Fatalf("reply = %q, want the caption of the image that was sent", out.ReplyText)
+	}
 }

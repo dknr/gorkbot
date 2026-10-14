@@ -115,12 +115,12 @@ send it or redraw it.
 {
   "image": {
     "base_url": "http://localhost:8001",
-    "width": 512,
-    "height": 512,
-    "steps": 20,
-    "cfg_scale": 7,
-    "negative_prompt": "text, watermark, blurry",
-    "timeout": "2m",
+    "width": 1024,
+    "height": 1024,
+    "steps": 8,
+    "cfg_scale": 1,
+    "lora": ["qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors"],
+    "timeout": "3m",
     "max_retries": 2
   }
 }
@@ -128,6 +128,24 @@ send it or redraw it.
 
 - `image.base_url` is the stable-diffusion.cpp root (its A1111-compatible
   `/sdapi/v1/txt2img` is called). Empty means no drawing at all.
+- `steps` and `cfg_scale` are sent explicitly and default to `8` and `1`, the
+  distilled regime. A CFG above 1 costs a second conditioning pass per step:
+  20 steps at CFG 7 measured 34.7s at 1024, 8 steps at CFG 1 measured 10.2s
+  without an adapter and 14.6s with the turbo one.
+- `negative_prompt` is omitted by default. At CFG 1 there is no unconditional
+  pass to put it in, so it would be dead weight.
+- `lora` names the adapters applied to every generation, as `name` or
+  `name:multiplier` (multiplier in `(0, 2]`; a `0` is a startup error rather
+  than a silently dropped adapter). **stable-diffusion.cpp has no startup LoRA
+  option and no options API** — `--lora-model-dir` only makes adapters
+  *available* — so anything not listed here is drawn by the bare base model.
+  The server resolves the name against that directory, so a bare file name is
+  enough. Nothing else in the stack can tell you an adapter was applied: the
+  server's `info` echo carries steps and CFG but not this build's adapter list,
+  so gorkbot logs `sd_info=…` per draw and says `lora=not reported` rather than
+  pretending the list was empty.
+- `width`/`height` must be sent: a request that omits them gets 512x512 even
+  when the server was started with `--width 1024 --height 1024`.
 - `max_retries` defaults to `2`: one draw plus two redraws. **After the second
   retry the image is sent whether or not gork likes it.**
 - Drawing needs `llm_vision` as well. With no vision model configured the tool

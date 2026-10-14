@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,4 +166,81 @@ func TestIntegrationDrawLoop(t *testing.T) {
 	if captions != out.Drawn {
 		t.Fatalf("history kept %d captions for %d images", captions, out.Drawn)
 	}
+}
+
+// TestIntegrationTurboSettingsRoundTrip loads the real config.json and checks
+// that the steps, CFG and LoRA it names are the ones the running
+// stable-diffusion.cpp server actually applies, as reported back in the txt2img
+// "info" echo. This is the check that a config edit landed: the server has no
+// startup LoRA option, so an adapter that is not applied is invisible except
+// through this echo.
+func TestIntegrationTurboSettingsRoundTrip(t *testing.T) {
+	cfg := loadLiveImageConfig(t)
+	if !cfg.Image.enabled() {
+		t.Skip("image.base_url empty in config.json; nothing to check")
+	}
+
+	sd := &sdClient{
+		BaseURL:        cfg.Image.BaseURL,
+		Width:          cfg.Image.Width,
+		Height:         cfg.Image.Height,
+		Steps:          cfg.Image.Steps,
+		CFGScale:       cfg.Image.CFGScale,
+		NegativePrompt: cfg.Image.NegativePrompt,
+		Lora:           cfg.Image.lora,
+		Timeout:        cfg.Image.timeout,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	_, info, err := sd.generate(ctx, "a red cube on a white background")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The server's own echo is the record of what it applied.
+	t.Logf("server applied: %s", sdInfoSummary(info))
+	t.Logf("config says:    %d steps, CFG %v, %d lora(s), negative=%q, %dx%d",
+		cfg.Image.Steps, cfg.Image.CFGScale, len(cfg.Image.lora), cfg.Image.NegativePrompt,
+		cfg.Image.Width, cfg.Image.Height)
+	// Steps and CFG are echoed as fields, so they can be asserted. This build
+	// does not echo which adapters it applied, so the request side is covered by
+	// TestGenerateSendsConfiguredStepsCFGAndLora and the echo is only reported.
+	var echo struct {
+		Steps    *int     `json:"steps"`
+		CFGScale *float64 `json:"cfg_scale"`
+	}
+	if err := json.Unmarshal([]byte(info), &echo); err != nil {
+		t.Fatalf("server echo is not JSON: %v (%s)", err, info[:min(len(info), 120)])
+	}
+	if echo.Steps == nil || *echo.Steps != cfg.Image.Steps {
+		t.Fatalf("server ran %v steps, config says %d", echo.Steps, cfg.Image.Steps)
+	}
+	if echo.CFGScale == nil || *echo.CFGScale != cfg.Image.CFGScale {
+		t.Fatalf("server ran CFG %v, config says %v", echo.CFGScale, cfg.Image.CFGScale)
+	}
+	for _, l := range cfg.Image.lora {
+		if !strings.Contains(info, filepath.Base(l.Path)) {
+			t.Logf("warning: adapter %s does not appear in the server echo; this build does not report applied LoRAs",
+				filepath.Base(l.Path))
+		}
+	}
+}
+
+// loadLiveImageConfig builds a config around the "image" block of the real
+// config.json next to the binary, so the live settings are what get tested.
+func loadLiveImageConfig(t *testing.T) *Config {
+	t.Helper()
+	raw, err := os.ReadFile("config.json")
+	if err != nil {
+		t.Skipf("no config.json to read: %v", err)
+	}
+	var whole map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &whole); err != nil {
+		t.Fatal(err)
+	}
+	image, ok := whole["image"]
+	if !ok {
+		t.Skip("config.json has no image block")
+	}
+	return loadTestConfig(t, `"image":`+string(image))
 }

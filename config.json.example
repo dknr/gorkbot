@@ -26,7 +26,9 @@
     "markdown": true
   },
   "invite": {
-    "allowed_inviters": ["@you:example.org"]
+    "allowed_inviters": [
+      "@you:example.org"
+    ]
   },
   "backfill": {
     "max_messages": 50,
@@ -36,9 +38,11 @@
     "base_url": "http://localhost:8001",
     "width": 512,
     "height": 512,
-    "steps": 20,
-    "cfg_scale": 7,
-    "negative_prompt": "text, watermark, blurry",
+    "steps": 8,
+    "cfg_scale": 1,
+    "lora": [
+      "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors"
+    ],
     "timeout": "2m",
     "max_retries": 2
   }

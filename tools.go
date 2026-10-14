@@ -10,6 +10,9 @@ import (
 	"image"
 	"io"
 	"net/http"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,17 +118,66 @@ type sdClient struct {
 	Height     int
 	Steps      int
 	CFGScale   float64
-	Timeout    time.Duration
+	// NegativePrompt is sent verbatim; empty means the field is omitted, which
+	// is what a CFG 1 model wants (see ImageConfig.NegativePrompt).
+	NegativePrompt string
+	// Lora lists the adapters applied to every generation. sd.cpp has no
+	// startup LoRA option and no options API, so an adapter can only be named
+	// per request: this is the only place it can be configured from.
+	Lora    []loraSpec
+	Timeout time.Duration
+}
+
+// loraSpec is one entry of the txt2img "lora" array. path is resolved by the
+// server against its --lora-model-dir, so a bare file name is enough;
+// multiplier defaults to 1.0 (src/stable-diffusion.cpp
+// examples/server/routes_sdapi.cpp).
+type loraSpec struct {
+	Path       string  `json:"path"`
+	Multiplier float64 `json:"multiplier"`
+}
+
+// parseLoraSpecs turns config entries of the form "name" or "name:0.8" into
+// server entries. A multiplier of 0 is rejected rather than silently dropping
+// the adapter: it usually means a typo in a config that meant to enable it.
+func parseLoraSpecs(entries []string) ([]loraSpec, error) {
+	out := make([]loraSpec, 0, len(entries))
+	for i, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			return nil, fmt.Errorf("image.lora entry %d is empty", i)
+		}
+		path := entry
+		multiplier := 1.0
+		if strings.HasPrefix(entry, ":") || strings.HasSuffix(entry, ":") {
+			return nil, fmt.Errorf("image.lora entry %q has no adapter name or no multiplier", raw)
+		}
+		if idx := strings.LastIndex(entry, ":"); idx > 0 {
+			head, tail := entry[:idx], entry[idx+1:]
+			if m, err := strconv.ParseFloat(tail, 64); err == nil {
+				path, multiplier = head, m
+			}
+		}
+		if strings.TrimSpace(path) == "" {
+			return nil, fmt.Errorf("image.lora entry %q has no adapter name", raw)
+		}
+		if multiplier <= 0 || multiplier > 2 {
+			return nil, fmt.Errorf("image.lora entry %q: multiplier must be in (0, 2], got %v", raw, multiplier)
+		}
+		out = append(out, loraSpec{Path: path, Multiplier: multiplier})
+	}
+	return out, nil
 }
 
 type sdRequest struct {
-	Prompt         string  `json:"prompt"`
-	NegativePrompt string  `json:"negative_prompt,omitempty"`
-	Width          int     `json:"width"`
-	Height         int     `json:"height"`
-	Steps          int     `json:"steps"`
-	CFGScale       float64 `json:"cfg_scale"`
-	Seed           int64   `json:"seed"`
+	Prompt         string     `json:"prompt"`
+	NegativePrompt string     `json:"negative_prompt,omitempty"`
+	Lora           []loraSpec `json:"lora,omitempty"`
+	Width          int        `json:"width"`
+	Height         int        `json:"height"`
+	Steps          int        `json:"steps"`
+	CFGScale       float64    `json:"cfg_scale"`
+	Seed           int64      `json:"seed"`
 }
 
 type sdResponse struct {
@@ -136,9 +188,13 @@ type sdResponse struct {
 // generate renders prompt and returns PNG bytes. Seed is -1 so every retry
 // produces a different image; retrying with the same seed would redraw the
 // same thing and defeat the purpose.
-func (s *sdClient) generate(ctx context.Context, prompt, negative string) ([]byte, error) {
+// generate renders prompt and returns the PNG plus the server's "info" echo.
+// The echo is the only proof of what the server actually applied (steps, CFG,
+// which LoRAs), and stable-diffusion.cpp has no startup LoRA, so it is worth
+// keeping rather than discarding.
+func (s *sdClient) generate(ctx context.Context, prompt string) ([]byte, string, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return nil, errors.New("empty draw prompt")
+		return nil, "", errors.New("empty draw prompt")
 	}
 	client := s.HTTPClient
 	if client == nil {
@@ -152,7 +208,8 @@ func (s *sdClient) generate(ctx context.Context, prompt, negative string) ([]byt
 
 	reqBody := sdRequest{
 		Prompt:         prompt,
-		NegativePrompt: negative,
+		NegativePrompt: s.NegativePrompt,
+		Lora:           s.Lora,
 		Width:          s.Width,
 		Height:         s.Height,
 		Steps:          s.Steps,
@@ -161,39 +218,39 @@ func (s *sdClient) generate(ctx context.Context, prompt, negative string) ([]byt
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal sd request: %w", err)
+		return nil, "", fmt.Errorf("marshal sd request: %w", err)
 	}
 
 	url := strings.TrimRight(s.BaseURL, "/") + "/sdapi/v1/txt2img"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create sd request: %w", err)
+		return nil, "", fmt.Errorf("create sd request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("send sd request: %w", err)
+		return nil, "", fmt.Errorf("send sd request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, sdBodyLimit>>4))
-		return nil, fmt.Errorf("sd status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		return nil, "", fmt.Errorf("sd status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
 
 	var parsed sdResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, fmt.Errorf("decode sd response: %w", err)
+		return nil, "", fmt.Errorf("decode sd response: %w", err)
 	}
 	if len(parsed.Images) == 0 || parsed.Images[0] == "" {
-		return nil, errors.New("sd returned no image")
+		return nil, "", errors.New("sd returned no image")
 	}
 	png, err := base64.StdEncoding.DecodeString(parsed.Images[0])
 	if err != nil {
-		return nil, fmt.Errorf("decode sd image: %w", err)
+		return nil, "", fmt.Errorf("decode sd image: %w", err)
 	}
-	return png, nil
+	return png, parsed.Info, nil
 }
 
 // drawRequest is the model-supplied argument payload for draw_image.
@@ -271,8 +328,8 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 	}
 	draw := b.drawImage
 	if draw == nil {
-		draw = func(ctx context.Context, prompt string) ([]byte, error) {
-			return b.sd.generate(ctx, prompt, b.image.NegativePrompt)
+		draw = func(ctx context.Context, prompt string) ([]byte, string, error) {
+			return b.sd.generate(ctx, prompt)
 		}
 	}
 	tools := drawTools()
@@ -289,6 +346,10 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 	maxDraws := b.image.maxRetries + 1
 	var lastPNG []byte
 	var lastPrompt string
+	// lastCaption is what the eyes reported about the image being sent. It is
+	// the only description that is neither the model's reasoning nor its prompt,
+	// so it is what the image event's alt text is built from.
+	var lastCaption string
 
 	for {
 		budgetLeft := out.Drawn < maxDraws
@@ -315,13 +376,23 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 		// draw forever.
 		if len(toolMsg.ToolCalls) == 0 || !budgetLeft {
 			if lastPNG != nil && !out.Sent {
-				if err := b.publishImage(ctx, msg, lastPNG, lastPrompt, toolMsg.Content); err != nil {
+				if err := b.publishImage(ctx, msg, lastPNG, imageAlt(lastCaption, lastPrompt)); err != nil {
 					log.Err(err).Msg("Failed to send drawn image")
 				} else {
 					out.Sent = true
 				}
 			}
 			out.ReplyText = toolMsg.Content
+			// Out of budget and still calling: the model is narrating its intent
+			// to draw again ("...I will call draw_image again with a corrected
+			// prompt"), which is a promise nothing will keep. Say what was drawn
+			// instead of relaying the intention.
+			if !budgetLeft && len(toolMsg.ToolCalls) > 0 {
+				log.Info().Str("discarded", firstLine(toolMsg.Content)).Msg("Model kept calling after the draw budget")
+				if alt := imageAlt(lastCaption, lastPrompt); alt != "" {
+					out.ReplyText = alt
+				}
+			}
 			return out, true
 		}
 
@@ -345,7 +416,7 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 				reply = strings.TrimSpace(toolMsg.Content)
 			}
 			if lastPNG != nil && !out.Sent {
-				if err := b.publishImage(ctx, msg, lastPNG, lastPrompt, reply); err != nil {
+				if err := b.publishImage(ctx, msg, lastPNG, imageAlt(lastCaption, lastPrompt)); err != nil {
 					log.Err(err).Msg("Failed to send drawn image")
 				} else {
 					out.Sent = true
@@ -360,7 +431,7 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 				log.Err(err).Msg("Bad draw_image arguments")
 			}
 			out.Drawn++
-			png, err := draw(ctx, args.Prompt)
+			png, drawInfo, err := draw(ctx, args.Prompt)
 			if err != nil {
 				log.Err(err).Str("draw_prompt", args.Prompt).Msg("Image generation failed")
 				history = append(history,
@@ -386,13 +457,14 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 			hm.AddMessage(llm.ChatMessage{Role: "user", Content: captionLine})
 			history = append(history, toolResult(call, caption))
 
-			lastPNG, lastPrompt = png, args.Prompt
+			lastPNG, lastPrompt, lastCaption = png, args.Prompt, caption
 			log.Info().Int("attempt", out.Drawn).Int("max_draws", maxDraws).
-				Str("caption", caption).Msg("Drew image")
+				Str("caption", caption).Str("sd_info", sdInfoSummary(drawInfo)).
+				Msg("Drew image")
 
 			if out.Drawn >= maxDraws {
 				// Retry budget spent: this result must be sent.
-				if err := b.publishImage(ctx, msg, lastPNG, lastPrompt, ""); err != nil {
+				if err := b.publishImage(ctx, msg, lastPNG, imageAlt(lastCaption, lastPrompt)); err != nil {
 					log.Err(err).Msg("Failed to send final image")
 				} else {
 					out.Sent = true
@@ -438,17 +510,46 @@ func userTurn(sender, content string) llm.ChatMessageTool {
 	return llm.ChatMessageTool{Role: "user", Content: sender + ": " + content}
 }
 
+// maxImageAlt caps the image event's alt text. Clients render body as a
+// caption or a tooltip, and the vision descriptions run to whole essays.
+const maxImageAlt = 120
+
+// imageAlt builds the alt text for the image event from what the eyes saw,
+// never from the model's reply or its draw prompt.
+//
+// Both of those are wrong here: the reply is sent as its own message, so
+// putting it in the image body too made the room show the same sentence twice,
+// once under the picture and once as a message; and the draw prompt is the
+// model's instruction, not a description of the result.
+func imageAlt(caption, drawPrompt string) string {
+	source := strings.TrimSpace(caption)
+	if source == "" {
+		source = strings.TrimSpace(drawPrompt)
+	}
+	if source == "" {
+		return "gork.png"
+	}
+	// First sentence, so a 600-token essay becomes one line.
+	for _, end := range []string{". ", "! ", "? ", "。"} {
+		if i := strings.Index(source, end); i > 0 {
+			source = source[:i+len(strings.TrimSpace(end))]
+			break
+		}
+	}
+	runes := []rune(source)
+	if len(runes) > maxImageAlt {
+		source = strings.TrimSpace(string(runes[:maxImageAlt])) + "…"
+	}
+	return source
+}
+
 // publishImage encrypts when the room needs it, uploads, and sends the
 // m.image event with whichever field the room's encryption calls for.
-func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, drawPrompt, replyText string) error {
+func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, alt string) error {
 	encrypt := b.mediaEncrypted(ctx, msg.roomID)
 	uri, file, err := b.uploadImage(ctx, png, "gork.png", encrypt)
 	if err != nil {
 		return fmt.Errorf("upload image: %w", err)
-	}
-	caption := replyText
-	if caption == "" {
-		caption = drawPrompt
 	}
 	// Log where the bytes actually landed. The mxc plus the encryption flag is
 	// everything needed to re-fetch the media through the authenticated and the
@@ -458,7 +559,7 @@ func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, drawPro
 		Bool("encrypted", file != nil).
 		Int64("bytes", int64(len(png))).
 		Msg("Image uploaded")
-	if err := b.sendImage(ctx, msg.roomID, uri, file, caption, png); err != nil {
+	if err := b.sendImage(ctx, msg.roomID, uri, file, alt, png); err != nil {
 		return fmt.Errorf("send image: %w", err)
 	}
 	return nil
@@ -581,4 +682,69 @@ func pngSize(data []byte) (int, int, error) {
 		return 0, 0, err
 	}
 	return cfg.Width, cfg.Height, nil
+}
+
+// sdInfoSummary pulls the fields worth logging out of the server's "info" echo.
+// Steps and CFG come back as proper fields; the applied LoRAs do not — this
+// build reports them only inside the free-text infotexts, as <lora:name:mult>
+// fragments — so they are scraped out, and reported as "not reported" rather
+// than as an empty list, which would falsely read as "no adapter applied".
+func sdInfoSummary(info string) string {
+	info = strings.TrimSpace(info)
+	if info == "" {
+		return ""
+	}
+	var parsed struct {
+		Steps    *int     `json:"steps"`
+		CFGScale *float64 `json:"cfg_scale"`
+		Loras    []struct {
+			Path string `json:"path"`
+			Name string `json:"name"`
+		} `json:"loras"`
+	}
+	if err := json.Unmarshal([]byte(info), &parsed); err != nil {
+		if len(info) > 120 {
+			return info[:120]
+		}
+		return info
+	}
+	names := make([]string, 0, 4)
+	for _, l := range parsed.Loras {
+		if l.Path != "" {
+			names = append(names, filepath.Base(l.Path))
+		} else if l.Name != "" {
+			names = append(names, l.Name)
+		}
+	}
+	if len(names) == 0 {
+		for _, m := range loraInlineRe.FindAllStringSubmatch(info, -1) {
+			names = append(names, filepath.Base(m[1]))
+		}
+	}
+	steps, cfg := -1, -1.0
+	if parsed.Steps != nil {
+		steps = *parsed.Steps
+	}
+	if parsed.CFGScale != nil {
+		cfg = *parsed.CFGScale
+	}
+	lora := "not reported"
+	if len(names) > 0 {
+		lora = strings.Join(names, ",")
+	}
+	return fmt.Sprintf("steps=%d cfg=%v lora=%s", steps, cfg, lora)
+}
+
+// loraInlineRe matches the inline adapter form sd.cpp accepts in a prompt.
+var loraInlineRe = regexp.MustCompile(`<lora:([^:>]+):([^>]+)>`)
+
+// firstLine truncates a log field to one line.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if r := []rune(s); len(r) > 100 {
+		return string(r[:100]) + "…"
+	}
+	return s
 }
