@@ -150,8 +150,20 @@ send it or redraw it.
   retry the image is sent whether or not gork likes it.**
 - Drawing needs `llm_vision` as well. With no vision model configured the tool
   is not offered: gork cannot judge a picture it cannot see.
-- Every generated image, including rejected retries, is described by the vision
-  model and kept in room history as `[🎨 image] <description>`.
+- Every attempt lands in room history as two **assistant** lines, failures
+  included: `[🎨 draw_image] <prompt>` before the attempt, then
+  `[🎨 draw_image result] <description>` from the vision model. They are not
+  user lines and carry no sender name — stored as `<sender>: <description>`,
+  the model read its own tool output back as something the person had said.
+- **A finished draw sends the image and nothing else.** No caption, no closing
+  sentence, no assessment. The `m.image` `body` is required by the spec and is
+  set to the inert `gork.png`, because clients render that field as a caption or
+  tooltip and any description there reads as a second message under the
+  picture. The vision description stays in the model's history, where the next
+  retry decision needs it, and the model's own closing text is dropped rather
+  than relayed — it tends to be an assessment, or a narration of an intention to
+  redraw that the budget will never honour. Text is still sent when no image
+  was: a declined request, or a draw that failed.
 
 The tool loop is deliberately blunt because Llama 3.2-3B on llama.cpp cannot
 be trusted with subtler tool handling. What the code assumes was measured on

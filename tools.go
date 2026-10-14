@@ -60,9 +60,16 @@ const (
 
 // toolNames for the tools gork exposes.
 const (
-	toolDrawImage     = "draw_image"
-	toolAnswerDirect  = "answer_directly"
-	toolHistoryPrefix = "[🎨 image] "
+	toolDrawImage    = "draw_image"
+	toolAnswerDirect = "answer_directly"
+
+	// toolCallPrefix marks the prompts gork sent to draw_image, and
+	// toolResultPrefix marks what the tool answered with. Both are written as
+	// assistant lines: the description used to be stored as a user message
+	// prefixed with the requester's name, so on the next turn the model read its
+	// own tool output back as something the person had said.
+	toolCallPrefix   = "[🎨 draw_image] "
+	toolResultPrefix = "[🎨 draw_image result] "
 )
 
 // drawTools returns the tool set offered to the model. answer_directly exists
@@ -345,11 +352,23 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 
 	maxDraws := b.image.maxRetries + 1
 	var lastPNG []byte
-	var lastPrompt string
-	// lastCaption is what the eyes reported about the image being sent. It is
-	// the only description that is neither the model's reasoning nor its prompt,
-	// so it is what the image event's alt text is built from.
-	var lastCaption string
+
+	// finish ends the run. Once a picture has been delivered nothing else goes
+	// to the room: the caption stays in the model's history, where it is needed
+	// for the next decision, and nowhere a user has to read.
+	finish := func(out imageOutcome) (imageOutcome, bool) {
+		if out.Sent && out.ReplyText != "" {
+			// Record it for the model and withhold it from the room. handle()
+			// only appends what it sends, so without this gork would have no
+			// record of its own last utterance and could answer the same request
+			// twice on the next turn.
+			hm.AddMessage(llm.ChatMessage{Role: "assistant", Content: out.ReplyText})
+			log.Debug().Str("withheld", firstLine(out.ReplyText)).
+				Msg("Suppressed closing text: only the image is sent")
+			out.ReplyText = ""
+		}
+		return out, true
+	}
 
 	for {
 		budgetLeft := out.Drawn < maxDraws
@@ -376,24 +395,23 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 		// draw forever.
 		if len(toolMsg.ToolCalls) == 0 || !budgetLeft {
 			if lastPNG != nil && !out.Sent {
-				if err := b.publishImage(ctx, msg, lastPNG, imageAlt(lastCaption, lastPrompt)); err != nil {
+				if err := b.publishImage(ctx, msg, lastPNG); err != nil {
 					log.Err(err).Msg("Failed to send drawn image")
 				} else {
 					out.Sent = true
 				}
 			}
+			// Anything the model says on this turn is withheld when the picture
+			// went out: the image is the answer. finish() still records it in
+			// history, so the conversation keeps its thread without the user
+			// getting a caption, an assessment, or a narration of an intention to
+			// redraw that nothing will keep.
 			out.ReplyText = toolMsg.Content
-			// Out of budget and still calling: the model is narrating its intent
-			// to draw again ("...I will call draw_image again with a corrected
-			// prompt"), which is a promise nothing will keep. Say what was drawn
-			// instead of relaying the intention.
 			if !budgetLeft && len(toolMsg.ToolCalls) > 0 {
-				log.Info().Str("discarded", firstLine(toolMsg.Content)).Msg("Model kept calling after the draw budget")
-				if alt := imageAlt(lastCaption, lastPrompt); alt != "" {
-					out.ReplyText = alt
-				}
+				log.Info().Str("discarded", firstLine(toolMsg.Content)).
+					Msg("Model kept calling after the draw budget")
 			}
-			return out, true
+			return finish(out)
 		}
 
 		// Act on the first call only: a response carrying two calls is a server
@@ -416,14 +434,14 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 				reply = strings.TrimSpace(toolMsg.Content)
 			}
 			if lastPNG != nil && !out.Sent {
-				if err := b.publishImage(ctx, msg, lastPNG, imageAlt(lastCaption, lastPrompt)); err != nil {
+				if err := b.publishImage(ctx, msg, lastPNG); err != nil {
 					log.Err(err).Msg("Failed to send drawn image")
 				} else {
 					out.Sent = true
 				}
 			}
 			out.ReplyText = reply
-			return out, true
+			return finish(out)
 
 		case toolDrawImage:
 			var args drawRequest
@@ -431,12 +449,16 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 				log.Err(err).Msg("Bad draw_image arguments")
 			}
 			out.Drawn++
+			// Record the prompt gork asked for, retry or not, and before the
+			// attempt: a draw that fails still needs to show up in the next
+			// turn's context, or the model has no idea it already tried.
+			hm.AddMessage(llm.ChatMessage{Role: "assistant", Content: toolCallPrefix + args.Prompt})
 			png, drawInfo, err := draw(ctx, args.Prompt)
 			if err != nil {
 				log.Err(err).Str("draw_prompt", args.Prompt).Msg("Image generation failed")
 				history = append(history,
 					toolResult(call, "the drawing failed: "+err.Error()),
-					userTurn(msg.sender, "The drawing failed. Reply to the user and say you could not draw it."))
+					harnessTurn("The drawing failed. Reply to the user and say you could not draw it."))
 				continue
 			}
 
@@ -452,28 +474,28 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 				caption = "(the drawing came out and could not be inspected)"
 			}
 
-			// Persist the description for every attempt, retry or not.
-			captionLine := msg.sender + ": " + toolHistoryPrefix + caption
-			hm.AddMessage(llm.ChatMessage{Role: "user", Content: captionLine})
+			// Persist the description for every attempt, retry or not, as gork's
+			// own tool output rather than as a message from the person who asked.
+			hm.AddMessage(llm.ChatMessage{Role: "assistant", Content: toolResultPrefix + caption})
 			history = append(history, toolResult(call, caption))
 
-			lastPNG, lastPrompt, lastCaption = png, args.Prompt, caption
+			lastPNG = png
 			log.Info().Int("attempt", out.Drawn).Int("max_draws", maxDraws).
 				Str("caption", caption).Str("sd_info", sdInfoSummary(drawInfo)).
 				Msg("Drew image")
 
 			if out.Drawn >= maxDraws {
 				// Retry budget spent: this result must be sent.
-				if err := b.publishImage(ctx, msg, lastPNG, imageAlt(lastCaption, lastPrompt)); err != nil {
+				if err := b.publishImage(ctx, msg, lastPNG); err != nil {
 					log.Err(err).Msg("Failed to send final image")
 				} else {
 					out.Sent = true
 				}
-				history = append(history, userTurn(msg.sender,
+				history = append(history, harnessTurn(
 					fmt.Sprintf("%s%s The picture has already been sent to the user. That was your last "+
 						"draw, you cannot draw again. Tell the user in one short sentence of your own words "+
 						"what the picture shows. Do not repeat the description above.",
-						toolHistoryPrefix, caption)))
+						toolResultPrefix, caption)))
 				// Loop again with tools withdrawn so the model closes the turn in text.
 				continue
 			}
@@ -481,17 +503,17 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 			if !inspectable {
 				// Redrawing on an unreadable description throws a generation
 				// away at a vision-model hiccup, so keep what was drawn.
-				history = append(history, userTurn(msg.sender,
-					toolHistoryPrefix+caption+" You could not see this picture, so do not judge it and "+
+				history = append(history, harnessTurn(
+					toolResultPrefix+caption+" You could not see this picture, so do not judge it and "+
 						"do not redraw it. Reply to the user in one short sentence saying what you drew."))
 				continue
 			}
 
-			history = append(history, userTurn(msg.sender,
+			history = append(history, harnessTurn(
 				fmt.Sprintf("%s%s Compare that with what the user asked for. If anything they asked for is "+
 					"missing or wrong, call draw_image again right now with a corrected prompt. Only reply to "+
 					"the user if the picture matches. You have drawn %d time(s) and may redraw %d more time(s).",
-					toolHistoryPrefix, caption, out.Drawn, maxDraws-out.Drawn)))
+					toolResultPrefix, caption, out.Drawn, maxDraws-out.Drawn)))
 
 		default:
 			log.Warn().Str("tool", call.Function.Name).Msg("Model called an unknown tool")
@@ -505,47 +527,26 @@ func toolResult(call llm.ToolCall, content string) llm.ChatMessageTool {
 	return llm.ChatMessageTool{Role: "tool", Content: content, ToolCallID: call.ID}
 }
 
-// userTurn builds a user-role message on the tool path.
-func userTurn(sender, content string) llm.ChatMessageTool {
-	return llm.ChatMessageTool{Role: "user", Content: sender + ": " + content}
-}
-
-// maxImageAlt caps the image event's alt text. Clients render body as a
-// caption or a tooltip, and the vision descriptions run to whole essays.
-const maxImageAlt = 120
-
-// imageAlt builds the alt text for the image event from what the eyes saw,
-// never from the model's reply or its draw prompt.
+// harnessTurn builds the harness's own turn on the tool path.
 //
-// Both of those are wrong here: the reply is sent as its own message, so
-// putting it in the image body too made the room show the same sentence twice,
-// once under the picture and once as a message; and the draw prompt is the
-// model's instruction, not a description of the result.
-func imageAlt(caption, drawPrompt string) string {
-	source := strings.TrimSpace(caption)
-	if source == "" {
-		source = strings.TrimSpace(drawPrompt)
-	}
-	if source == "" {
-		return "gork.png"
-	}
-	// First sentence, so a 600-token essay becomes one line.
-	for _, end := range []string{". ", "! ", "? ", "。"} {
-		if i := strings.Index(source, end); i > 0 {
-			source = source[:i+len(strings.TrimSpace(end))]
-			break
-		}
-	}
-	runes := []rune(source)
-	if len(runes) > maxImageAlt {
-		source = strings.TrimSpace(string(runes[:maxImageAlt])) + "…"
-	}
-	return source
+// The role has to stay "user": Llama 3.2-3B on llama.cpp was measured reading
+// user turns while tools are offered and ignoring tool-role content. The text
+// is therefore labelled with the tool marker instead of the sender's name, so
+// the model can tell the harness speaking from the person asking.
+func harnessTurn(content string) llm.ChatMessageTool {
+	return llm.ChatMessageTool{Role: "user", Content: content}
 }
+
+// imageBody is the m.image "body" field. The spec requires it, but it is not a
+// caption: clients use it as alt text, a tooltip or a filename, and any
+// description put here shows up in the room as a second message under the
+// picture. A plain filename is what other clients send (Cinny sends
+// file.name), and it renders as nothing.
+const imageBody = "gork.png"
 
 // publishImage encrypts when the room needs it, uploads, and sends the
 // m.image event with whichever field the room's encryption calls for.
-func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, alt string) error {
+func (b *Bot) publishImage(ctx context.Context, msg message, png []byte) error {
 	encrypt := b.mediaEncrypted(ctx, msg.roomID)
 	uri, file, err := b.uploadImage(ctx, png, "gork.png", encrypt)
 	if err != nil {
@@ -559,7 +560,7 @@ func (b *Bot) publishImage(ctx context.Context, msg message, png []byte, alt str
 		Bool("encrypted", file != nil).
 		Int64("bytes", int64(len(png))).
 		Msg("Image uploaded")
-	if err := b.sendImage(ctx, msg.roomID, uri, file, alt, png); err != nil {
+	if err := b.sendImage(ctx, msg.roomID, uri, file, imageBody, png); err != nil {
 		return fmt.Errorf("send image: %w", err)
 	}
 	return nil

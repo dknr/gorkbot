@@ -159,7 +159,7 @@ func TestIntegrationDrawLoop(t *testing.T) {
 	}
 	captions := 0
 	for _, m := range hm.Messages() {
-		if len(m.Content) > len(toolHistoryPrefix) && contains(m.Content, toolHistoryPrefix) {
+		if len(m.Content) > len(toolResultPrefix) && contains(m.Content, toolResultPrefix) {
 			captions++
 		}
 	}

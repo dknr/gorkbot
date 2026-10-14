@@ -228,8 +228,9 @@ func TestToolLoopDrawThenAccept(t *testing.T) {
 	if out.Drawn != 1 || !out.Sent {
 		t.Fatalf("drawn=%d sent=%v, want 1/true", out.Drawn, out.Sent)
 	}
-	if out.ReplyText != "a cube, as commanded" {
-		t.Fatalf("reply = %q", out.ReplyText)
+	// The picture is the whole reply; the model's closing sentence is dropped.
+	if out.ReplyText != "" {
+		t.Fatalf("reply = %q, want nothing sent alongside the image", out.ReplyText)
 	}
 	if len(*d.drawn) != 1 || (*d.drawn)[0] != "a red cube" {
 		t.Fatalf("draw prompts = %v", *d.drawn)
@@ -237,7 +238,7 @@ func TestToolLoopDrawThenAccept(t *testing.T) {
 	if len(*d.send) != 1 {
 		t.Fatalf("images sent = %d, want 1", len(*d.send))
 	}
-	if want := toolHistoryPrefix + "a red cube on a hill"; !contains(d.historyText(), want) {
+	if want := toolResultPrefix + "a red cube on a hill"; !contains(d.historyText(), want) {
 		t.Fatalf("history missing vision caption %q:\n%s", want, d.historyText())
 	}
 }
@@ -279,7 +280,7 @@ func TestToolLoopSendsAfterSecondRetryEvenIfModelNeverAccepts(t *testing.T) {
 	// Every attempt's description stays in history, sent or not.
 	hist := d.historyText()
 	for _, want := range []string{"attempt one", "attempt two", "attempt three"} {
-		if !contains(hist, toolHistoryPrefix+want) {
+		if !contains(hist, toolResultPrefix+want) {
 			t.Fatalf("history missing caption %q:\n%s", want, hist)
 		}
 	}
@@ -770,60 +771,37 @@ func TestSDInfoSummary(t *testing.T) {
 	}
 }
 
-func TestImageAltUsesTheVisionCaption(t *testing.T) {
-	caption := "The image shows a red cube on grass. It is rendered in a hyper-realistic " +
-		"style with dramatic lighting and a long tail of further observations that would " +
-		"scroll off the bottom of any client window."
-	got := imageAlt(caption, "a red cube on grass in a hyper realistic style")
-	if got != "The image shows a red cube on grass." {
-		t.Fatalf("alt = %q", got)
-	}
-}
-
-func TestImageAltFallsBackAndCaps(t *testing.T) {
-	if got := imageAlt("", "a purple cat"); got != "a purple cat" {
-		t.Fatalf("fallback alt = %q", got)
-	}
-	if got := imageAlt("", ""); got != "gork.png" {
-		t.Fatalf("empty alt = %q", got)
-	}
-	long := imageAlt(strings.Repeat("word ", 200), "")
-	if len([]rune(long)) > maxImageAlt+2 {
-		t.Fatalf("alt not capped: %d runes", len([]rune(long)))
-	}
-	if !strings.HasSuffix(long, "…") {
-		t.Fatalf("capped alt has no ellipsis: %q", long)
-	}
-}
-
-// The room must receive the model's reply exactly once: as the text message.
-// Putting it in the image body as well is what made the same sentence appear
-// twice under one picture.
-func TestToolLoopSendsReplyTextOnce(t *testing.T) {
+// A finished draw is the image and nothing else: no caption on the event, no
+// closing message. The reply text stays in the model's history, where the next
+// decision needs it, but it must not reach the room.
+func TestToolLoopSendsOnlyTheImage(t *testing.T) {
 	d := newDrawBot(t, []llm.ToolMessage{
 		toolCallMsg("c1", toolDrawImage, `{"prompt":"a cube"}`),
 		textMsg("a cube, as commanded"),
 	}, []string{"a red cube on a hill, quite nice"}, nil)
 
 	out := d.run(t)
-	if out.ReplyText != "a cube, as commanded" {
-		t.Fatalf("reply = %q", out.ReplyText)
+	if out.ReplyText != "" {
+		t.Fatalf("text sent alongside the image: %q", out.ReplyText)
 	}
 	if len(*d.send) != 1 {
-		t.Fatalf("images sent = %d", len(*d.send))
+		t.Fatalf("images sent = %d, want 1", len(*d.send))
 	}
-	if (*d.send)[0] == out.ReplyText {
-		t.Fatal("the reply text was also used as the image alt text; the room shows it twice")
+	if (*d.send)[0] != imageBody {
+		t.Fatalf("image body = %q, want the inert %q", (*d.send)[0], imageBody)
 	}
-	// The caption has no sentence break, so it is used whole.
-	if (*d.send)[0] != "a red cube on a hill, quite nice" {
-		t.Fatalf("image alt = %q, want the vision caption", (*d.send)[0])
+	// The description is still preserved for the model.
+	if !contains(d.historyText(), "a red cube on a hill") {
+		t.Fatalf("vision caption missing from history:\n%s", d.historyText())
+	}
+	// So is gork's own closing sentence: withheld from the room, kept in
+	// history, otherwise the next turn has no record of this one being answered.
+	if !contains(d.historyText(), "a cube, as commanded") {
+		t.Fatalf("withheld reply missing from history:\n%s", d.historyText())
 	}
 }
 
-// Out of draws and still calling: the narration must not be relayed, because it
-// promises a redraw that will never come.
-func TestToolLoopReplacesNarrationAfterBudgetSpent(t *testing.T) {
+func TestToolLoopSendsNothingAfterBudgetSpent(t *testing.T) {
 	narrate := llm.ToolMessage{
 		FinishReason: "tool_calls",
 		Content: "Since the image drawn does not match the user's request, I will call " +
@@ -838,10 +816,57 @@ func TestToolLoopReplacesNarrationAfterBudgetSpent(t *testing.T) {
 	if out.Drawn != 3 || !out.Sent {
 		t.Fatalf("drawn=%d sent=%v", out.Drawn, out.Sent)
 	}
-	if strings.Contains(out.ReplyText, "I will call") {
-		t.Fatalf("relayed the model's unfulfilled intention as a reply: %q", out.ReplyText)
+	if out.ReplyText != "" {
+		t.Fatalf("reply = %q, want nothing once the image is out", out.ReplyText)
 	}
-	if out.ReplyText != "three." {
-		t.Fatalf("reply = %q, want the caption of the image that was sent", out.ReplyText)
+}
+
+// The description is gork's tool output. Recorded as a user line carrying the
+// requester's name, the next turn reads it as something the person said.
+func TestToolLoopHistoryAttributesToolOutputToGork(t *testing.T) {
+	d := newDrawBot(t, []llm.ToolMessage{
+		toolCallMsg("c1", toolDrawImage, `{"prompt":"a red cube on a hill"}`),
+		textMsg("done"),
+	}, []string{"a red cube sitting on a hill under a blue sky"}, nil)
+	d.run(t)
+
+	hist := d.historyText()
+	if !contains(hist, toolResultPrefix+"a red cube sitting on a hill") {
+		t.Fatalf("tool result marker missing from history:\n%s", hist)
+	}
+	// The old form was "<sender>: [marker] <caption>". Any sender prefix on a
+	// tool-output line is the bug.
+	for _, m := range d.hm.Messages() {
+		if contains(m.Content, ": "+toolResultPrefix) {
+			t.Fatalf("tool output attributed to a sender: %q", m.Content)
+		}
+	}
+	// Prompt and result both land, and the result is not a user turn.
+	if !contains(hist, toolCallPrefix+"a red cube on a hill") {
+		t.Fatalf("draw prompt missing from history:\n%s", hist)
+	}
+	for _, m := range d.hm.Messages() {
+		if contains(m.Content, toolResultPrefix) && m.Role != "assistant" {
+			t.Fatalf("tool output stored as %q role: %q", m.Role, m.Content)
+		}
+		if contains(m.Content, toolCallPrefix) && m.Role != "assistant" {
+			t.Fatalf("draw prompt stored as %q role: %q", m.Role, m.Content)
+		}
+	}
+}
+
+// A failed draw still has to be visible to the next turn, or gork redoes work
+// it already tried and cannot explain why it gave up.
+func TestToolLoopRecordsFailedDrawPrompt(t *testing.T) {
+	d := newDrawBot(t, []llm.ToolMessage{
+		toolCallMsg("c1", toolDrawImage, `{"prompt":"a broken thing"}`),
+		textMsg("could not draw it"),
+	}, nil, errors.New("sd down"))
+	out := d.run(t)
+	if out.Sent {
+		t.Fatal("nothing was drawn, so nothing should have been sent")
+	}
+	if !contains(d.historyText(), toolCallPrefix+"a broken thing") {
+		t.Fatalf("failed draw prompt missing from history:\n%s", d.historyText())
 	}
 }
