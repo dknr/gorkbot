@@ -51,7 +51,7 @@ func TestIntegrationDrawLoop(t *testing.T) {
 	retries := 2
 	cfg := &Config{
 		LLM:       LLMConfig{BaseURL: llmURL, Model: "default"},
-		LLMVision: LLMVisionConfig{BaseURL: visionURL, Model: "qwen3.8-flash-next", ImagePrompt: "Describe what you see in this image.", MaxTokens: 1600},
+		LLMVision: LLMVisionConfig{BaseURL: visionURL, Model: "qwen3.8-flash-next", ImagePrompt: visionPromptDefault, MaxTokens: visionMaxTokensDefault},
 		Image:     ImageConfig{BaseURL: sdURL, Width: 512, Height: 512, Steps: 12, CFGScale: 7, Timeout: "3m", MaxRetries: &retries},
 	}
 	cfg.Image.timeout = 3 * time.Minute

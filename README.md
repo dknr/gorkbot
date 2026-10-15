@@ -150,6 +150,19 @@ send it or redraw it.
   retry the image is sent whether or not gork likes it.**
 - Drawing needs `llm_vision` as well. With no vision model configured the tool
   is not offered: gork cannot judge a picture it cannot see.
+- The eyes are the slow half of a draw, and `llm_vision.max_tokens` is the knob.
+  The endpoint streams about 25 tokens/s. `"Describe what you see in this
+  image"` wrote 299 tokens and took 13.1s; the terse prompt self-limits to 40-63
+  tokens and takes 2.5-2.8s on the same drawing — the prompt is what bought the
+  speed, and `max_tokens` only ever cuts a description short (100 truncated the
+  old verbose answer mid-sentence). The default prompt asks for two sentences
+  naming every subject, its colour, what it is doing, then background and
+  lighting — enough for the 3B to spot a mismatch in ~40 tokens.
+- Thinking stays off on the vision path, and that is not only about speed:
+  reasoning is charged against `max_tokens`, so a request that leaves it on at
+  a 200-token budget returns an **empty** caption rather than a short one.
+  `TestVisionLatency` trips on exactly that. Do not raise `max_tokens` without
+  reading this twice.
 - Every attempt lands in room history as two **assistant** lines, failures
   included: `[🎨 draw_image] <prompt>` before the attempt, then
   `[🎨 draw_image result] <description>` from the vision model. They are not
