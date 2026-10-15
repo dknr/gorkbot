@@ -43,7 +43,12 @@
     "lora": [
       "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors"
     ],
-    "timeout": "2m",
-    "max_retries": 2
+    "timeout": "5m",
+    "max_retries": 2,
+    "quality": {
+      "steps": 40,
+      "cfg_scale": 8,
+      "lora": []
+    }
   }
 }

@@ -192,7 +192,7 @@ func TestIntegrationTurboSettingsRoundTrip(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	_, info, err := sd.generate(ctx, "a red cube on a white background")
+	_, info, err := sd.generate(ctx, "a red cube on a white background", false)
 	if err != nil {
 		t.Fatal(err)
 	}

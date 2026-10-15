@@ -65,7 +65,7 @@ type Bot struct {
 	sd            *sdClient
 	completeTools func(ctx context.Context, history []llm.ChatMessageTool, tools []llm.Tool, toolChoice any,
 		temperature float64, maxTokens int) (llm.ToolMessage, llm.UsageInfo, error)
-	drawImage   func(ctx context.Context, prompt string) ([]byte, string, error)
+	drawImage   func(ctx context.Context, prompt string, quality bool) ([]byte, string, error)
 	uploadFn    func(ctx context.Context, data []byte, name string, encrypt bool) (id.ContentURI, *event.EncryptedFileInfo, error)
 	sendImageFn func(ctx context.Context, roomID id.RoomID, uri id.ContentURI, file *event.EncryptedFileInfo, caption string, png []byte) error
 	// mediaEncryptedFn overrides the room encryption check (test seam).
@@ -100,6 +100,9 @@ func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, llmVision
 		bot.image = config.Image
 		bot.sd = &sdClient{
 			BaseURL:        config.Image.BaseURL,
+			QualitySteps:   config.Image.Quality.Steps,
+			QualityCFG:     config.Image.Quality.CFGScale,
+			QualityLora:    config.Image.qualityLora,
 			Width:          config.Image.Width,
 			Height:         config.Image.Height,
 			Steps:          config.Image.Steps,
@@ -108,8 +111,8 @@ func NewBot(log zerolog.Logger, config *Config, llmClient *llm.Client, llmVision
 			Lora:           config.Image.lora,
 			Timeout:        config.Image.timeout,
 		}
-		bot.drawImage = func(ctx context.Context, prompt string) ([]byte, string, error) {
-			return bot.sd.generate(ctx, prompt)
+		bot.drawImage = func(ctx context.Context, prompt string, quality bool) ([]byte, string, error) {
+			return bot.sd.generate(ctx, prompt, quality)
 		}
 	}
 	return bot

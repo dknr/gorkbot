@@ -65,6 +65,7 @@ type drawBot struct {
 	hm        *HistoryManager
 	send      *[]string // captions of images that reached the room
 	drawn     *[]string // prompts sent to the diffusion server
+	quality   *[]bool   // which profile each attempt asked for
 	uploads   *int
 	turns     *[]toolTurn
 	encrypted *[]bool
@@ -82,6 +83,7 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 	var mu sync.Mutex
 	var turnList []toolTurn
 	var drawList []string
+	var qualityList []bool
 	var sendList []string
 	uploads := 0
 	var uploadEncrypted []bool
@@ -116,10 +118,11 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 		return reply, llm.UsageInfo{}, nil
 	}
 
-	b.drawImage = func(_ context.Context, prompt string) ([]byte, string, error) {
+	b.drawImage = func(_ context.Context, prompt string, quality bool) ([]byte, string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		drawList = append(drawList, prompt)
+		qualityList = append(qualityList, quality)
 		if drawErr != nil {
 			return nil, "", drawErr
 		}
@@ -178,7 +181,8 @@ func newDrawBot(t *testing.T, replies []llm.ToolMessage, captions []string, draw
 	}
 
 	hm := b.historyMgr.GetOrCreate(testRoom, 50, time.Minute)
-	d := &drawBot{bot: b, hm: hm, send: &sendList, drawn: &drawList, uploads: &uploads, turns: &turnList}
+	d := &drawBot{bot: b, hm: hm, send: &sendList, drawn: &drawList, uploads: &uploads,
+		turns: &turnList, quality: &qualityList}
 	d.encrypted = &uploadEncrypted
 	return d
 }
@@ -353,7 +357,7 @@ func TestSDClientGenerateDecodesPNG(t *testing.T) {
 	defer srv.Close()
 
 	sd := &sdClient{BaseURL: srv.URL, Width: 512, Height: 512, Steps: 12, CFGScale: 7, Timeout: time.Minute}
-	data, info, err := sd.generate(context.Background(), "a red cube")
+	data, info, err := sd.generate(context.Background(), "a red cube", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +374,7 @@ func TestSDClientGenerateDecodesPNG(t *testing.T) {
 
 func TestSDClientGenerateRejectsEmptyPrompt(t *testing.T) {
 	sd := &sdClient{BaseURL: "http://127.0.0.1:1"}
-	if _, _, err := sd.generate(context.Background(), "   "); err == nil {
+	if _, _, err := sd.generate(context.Background(), "   ", false); err == nil {
 		t.Fatal("expected an error for an empty prompt")
 	}
 }
@@ -386,8 +390,13 @@ func TestImageConfigDefaults(t *testing.T) {
 	if cfg.Image.Width != 512 || cfg.Image.Height != 512 || cfg.Image.Steps != 8 || cfg.Image.CFGScale != 1 {
 		t.Fatalf("unexpected defaults: %+v", cfg.Image)
 	}
-	if cfg.Image.timeout != 2*time.Minute {
+	if cfg.Image.timeout != 5*time.Minute {
 		t.Fatalf("timeout default = %v", cfg.Image.timeout)
+	}
+	// The final attempt escalates by default, and the timeout above has to clear
+	// a render that measured 116-120s here.
+	if cfg.Image.Quality.Steps != 40 || cfg.Image.Quality.CFGScale != 8 || len(cfg.Image.qualityLora) != 0 {
+		t.Fatalf("quality defaults = %+v (%d adapters)", cfg.Image.Quality, len(cfg.Image.qualityLora))
 	}
 }
 
@@ -614,6 +623,10 @@ func loadTestConfig(t *testing.T, extra string) *Config {
 // sdCaptured holds the last txt2img body the fake server received.
 var sdCaptured = new(sdRequest)
 
+// sdCapturedRaw keeps the bytes as sent, so tests can tell an omitted "lora"
+// key from an empty list.
+var sdCapturedRaw = new([]byte)
+
 func newSDTestServer(t *testing.T, pngBytes []byte) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -626,6 +639,8 @@ func newSDTestServer(t *testing.T, pngBytes []byte) *httptest.Server {
 			t.Errorf("bad sd request: %v", err)
 		}
 		*sdCaptured = req
+		body, _ := io.ReadAll(r.Body)
+		*sdCapturedRaw = body
 		if req.Prompt == "" {
 			http.Error(w, "prompt is required", http.StatusBadRequest)
 			return
@@ -647,6 +662,91 @@ func mustContentURI(t *testing.T, raw string) id.ContentURI {
 	return uri
 }
 
+// The final attempt is the picture the user keeps, so it is the one paid for:
+// full steps and CFG, and no turbo adapter, which is what makes a fast draw
+// look soft.
+func TestGenerateQualityProfileDropsTheTurboAdapter(t *testing.T) {
+	srv := newSDTestServer(t, testPNG)
+	defer srv.Close()
+
+	sd := &sdClient{
+		BaseURL: srv.URL, Width: 1024, Height: 1024, Steps: 8, CFGScale: 1,
+		Lora:         []loraSpec{{Path: "turbo.safetensors", Multiplier: 1}},
+		QualitySteps: 40, QualityCFG: 8, QualityLora: nil,
+		Timeout: time.Minute,
+	}
+	if _, _, err := sd.generate(context.Background(), "a cube", true); err != nil {
+		t.Fatal(err)
+	}
+	got := *sdCaptured
+	if got.Steps != 40 || got.CFGScale != 8 {
+		t.Fatalf("quality steps/cfg = %d/%v, want 40/8", got.Steps, got.CFGScale)
+	}
+	if len(got.Lora) != 0 {
+		t.Fatalf("quality profile applied adapters: %+v", got.Lora)
+	}
+	if contains(string(*sdCapturedRaw), `"lora"`) {
+		t.Fatalf("empty lora list sent instead of the key being omitted: %s", *sdCapturedRaw)
+	}
+	if got.Width != 1024 || got.Height != 1024 {
+		t.Fatalf("quality profile changed the size: %dx%d", got.Width, got.Height)
+	}
+
+	// The fast profile is untouched.
+	if _, _, err := sd.generate(context.Background(), "a cube", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := *sdCaptured; got.Steps != 8 || got.CFGScale != 1 || len(got.Lora) != 1 {
+		t.Fatalf("fast profile changed: steps=%d cfg=%v lora=%+v", got.Steps, got.CFGScale, got.Lora)
+	}
+}
+
+// Attempts that will be thrown away stay on the fast profile; only the last
+// allowed one escalates.
+func TestToolLoopUsesQualityProfileOnlyOnFinalAttempt(t *testing.T) {
+	draw := func(id string, prompt string) llm.ToolMessage {
+		return toolCallMsg(id, toolDrawImage, `{"prompt":"`+prompt+`"}`)
+	}
+	d := newDrawBot(t, []llm.ToolMessage{
+		draw("c1", "cube"), draw("c2", "red cube"), draw("c3", "red cube on grass"),
+		textMsg("done"),
+	}, []string{"wrong", "closer", "a red cube on grass"}, nil)
+
+	out := d.run(t)
+	if out.Drawn != 3 {
+		t.Fatalf("drawn = %d, want 3", out.Drawn)
+	}
+	got := *d.quality
+	want := []bool{false, false, true}
+	if len(got) != len(want) {
+		t.Fatalf("profiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("attempt %d quality = %v, want %v (all of %v)", i+1, got[i], want[i], got)
+		}
+	}
+}
+
+// With no redraw budget the single draw is an uncorrected first guess, so it
+// must not pay two minutes for a prompt nobody has had a chance to correct.
+func TestToolLoopNoQualityEscalationWithoutRetryBudget(t *testing.T) {
+	d := newDrawBot(t, []llm.ToolMessage{
+		toolCallMsg("c1", toolDrawImage, `{"prompt":"cube"}`),
+		textMsg("done"),
+	}, []string{"a red cube"}, nil)
+	d.bot.image.maxRetries = 0
+
+	out := d.run(t)
+	if out.Drawn != 1 {
+		t.Fatalf("drawn = %d, want 1", out.Drawn)
+	}
+	if (*d.quality)[0] {
+		t.Fatal("the only draw escalated to the quality profile; with no retry budget " +
+			"every picture would cost the two-minute path")
+	}
+}
+
 func TestGenerateSendsConfiguredStepsCFGAndLora(t *testing.T) {
 	srv := newSDTestServer(t, testPNG)
 	defer srv.Close()
@@ -656,7 +756,7 @@ func TestGenerateSendsConfiguredStepsCFGAndLora(t *testing.T) {
 		Lora:    []loraSpec{{Path: "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors", Multiplier: 1}},
 		Timeout: time.Minute,
 	}
-	if _, _, err := sd.generate(context.Background(), "a cube"); err != nil {
+	if _, _, err := sd.generate(context.Background(), "a cube", false); err != nil {
 		t.Fatal(err)
 	}
 	got := *sdCaptured

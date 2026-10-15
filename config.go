@@ -64,6 +64,9 @@ type ImageConfig struct {
 	CFGScale       float64 `json:"cfg_scale"`
 	NegativePrompt string  `json:"negative_prompt"`
 	Timeout        string  `json:"timeout"`
+	// Quality holds the diffusion settings for the final allowed attempt, which
+	// is the picture the user keeps. See ImageQualityConfig.
+	Quality ImageQualityConfig `json:"quality"`
 	// Lora names the adapters applied to every generation, as "name" or
 	// "name:multiplier". The server resolves the name against its
 	// --lora-model-dir, so a bare file name is enough. stable-diffusion.cpp has
@@ -76,9 +79,26 @@ type ImageConfig struct {
 	// field, which defaults to 2.
 	MaxRetries *int `json:"max_retries"`
 
-	maxRetries int
-	timeout    time.Duration
-	lora       []loraSpec
+	maxRetries  int
+	timeout     time.Duration
+	lora        []loraSpec
+	qualityLora []loraSpec
+}
+
+// ImageQualityConfig holds the settings for the last attempt gork is allowed to
+// draw. The earlier attempts are fast on purpose, because most of them are
+// thrown away: gork is hunting for a prompt that produces what was asked for.
+// By the last attempt the prompt is usually good and the result is the one that
+// gets sent, so it is worth paying for the base model's full settings instead
+// of the turbo adapter. Measured on this server at 1024x1024: 15s at
+// steps 8 + CFG 1 + turbo LoRA, 115.6s at steps 40 + CFG 8 + no adapter.
+type ImageQualityConfig struct {
+	Steps    int     `json:"steps"`
+	CFGScale float64 `json:"cfg_scale"`
+	// Lora follows the same rules as image.lora. An empty list is the point
+	// here: the turbo adapter is what makes a fast draw look soft, and the final
+	// image is drawn without it.
+	Lora []string `json:"lora"`
 }
 
 // enabled reports whether image generation is configured.
@@ -211,12 +231,25 @@ func LoadConfig(path string, console bool) (*Config, error) {
 	if cfg.Image.CFGScale <= 0 {
 		cfg.Image.CFGScale = 1
 	}
+	if cfg.Image.Quality.Steps <= 0 {
+		cfg.Image.Quality.Steps = 40
+	}
+	if cfg.Image.Quality.CFGScale <= 0 {
+		cfg.Image.Quality.CFGScale = 8
+	}
+	cfg.Image.qualityLora, err = parseLoraSpecs(cfg.Image.Quality.Lora)
+	if err != nil {
+		return nil, fmt.Errorf("image.quality.lora: %w", err)
+	}
 	cfg.Image.lora, err = parseLoraSpecs(cfg.Image.Lora)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Image.Timeout == "" {
-		cfg.Image.Timeout = "2m"
+		// The per-request timeout, not the whole draw cycle. A quality-attempt
+		// render measured 116-120s on this box, so a shorter default would fail
+		// the one attempt whose result is actually sent.
+		cfg.Image.Timeout = "5m"
 	}
 	imageTimeout, err := time.ParseDuration(cfg.Image.Timeout)
 	if err != nil {

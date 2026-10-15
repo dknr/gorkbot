@@ -148,6 +148,21 @@ send it or redraw it.
   when the server was started with `--width 1024 --height 1024`.
 - `max_retries` defaults to `2`: one draw plus two redraws. **After the second
   retry the image is sent whether or not gork likes it.**
+- `quality` holds the settings for that last attempt, defaulting to `steps: 40`,
+  `cfg_scale: 8`, `lora: []`. The reasoning is that the earlier attempts are a
+  search for a prompt and get thrown away, while the last one is the picture the
+  user keeps and usually has two corrections behind it — so it is the one worth
+  rendering without the turbo adapter. It is not cheap: measured at 1024 on this
+  box, **116–120s at 40 steps/CFG 8 and 71.4s at 20 steps/CFG 8**, against 15s on
+  the fast profile, so a third-attempt run costs roughly 145s end to end. An
+  empty `lora` list is the point: the `lora` key is then omitted from the request
+  entirely. `image.timeout` (default `5m`) is per request and must clear that
+  render, because timing out on the last attempt means no image at all. With
+  `max_retries: 0` there is nothing to correct the prompt, so the single draw
+  stays on the fast profile rather than paying full price every time.
+  (An earlier note here claimed 34.7s for 20 steps at CFG 7; it does not
+  reproduce against today's 71.4s at CFG 8, so treat the older figure as
+  suspect.)
 - Drawing needs `llm_vision` as well. With no vision model configured the tool
   is not offered: gork cannot judge a picture it cannot see.
 - The eyes are the slow half of a draw, and `llm_vision.max_tokens` is the knob.

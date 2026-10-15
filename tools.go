@@ -133,6 +133,15 @@ type sdClient struct {
 	// per request: this is the only place it can be configured from.
 	Lora    []loraSpec
 	Timeout time.Duration
+
+	// Quality profile, used only for the final allowed attempt, whose result is
+	// the one that gets sent. Full diffusion settings and no turbo adapter, so
+	// it looks markedly better and costs most of two minutes (see
+	// ImageQualityConfig). Width, height and the timeout are shared with the fast
+	// profile.
+	QualitySteps int
+	QualityCFG   float64
+	QualityLora  []loraSpec
 }
 
 // loraSpec is one entry of the txt2img "lora" array. path is resolved by the
@@ -199,7 +208,7 @@ type sdResponse struct {
 // The echo is the only proof of what the server actually applied (steps, CFG,
 // which LoRAs), and stable-diffusion.cpp has no startup LoRA, so it is worth
 // keeping rather than discarding.
-func (s *sdClient) generate(ctx context.Context, prompt string) ([]byte, string, error) {
+func (s *sdClient) generate(ctx context.Context, prompt string, quality bool) ([]byte, string, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return nil, "", errors.New("empty draw prompt")
 	}
@@ -213,14 +222,22 @@ func (s *sdClient) generate(ctx context.Context, prompt string) ([]byte, string,
 		defer cancel()
 	}
 
+	// The fast profile trades quality for a redraw cycle that fits in a
+	// conversation; the quality profile is only paid for once, on the attempt
+	// whose result is actually sent.
+	steps, cfgScale, lora := s.Steps, s.CFGScale, s.Lora
+	if quality {
+		steps, cfgScale, lora = s.QualitySteps, s.QualityCFG, s.QualityLora
+	}
+
 	reqBody := sdRequest{
 		Prompt:         prompt,
 		NegativePrompt: s.NegativePrompt,
-		Lora:           s.Lora,
+		Lora:           lora,
 		Width:          s.Width,
 		Height:         s.Height,
-		Steps:          s.Steps,
-		CFGScale:       s.CFGScale,
+		Steps:          steps,
+		CFGScale:       cfgScale,
 		Seed:           -1,
 	}
 	body, err := json.Marshal(reqBody)
@@ -335,8 +352,8 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 	}
 	draw := b.drawImage
 	if draw == nil {
-		draw = func(ctx context.Context, prompt string) ([]byte, string, error) {
-			return b.sd.generate(ctx, prompt)
+		draw = func(ctx context.Context, prompt string, quality bool) ([]byte, string, error) {
+			return b.sd.generate(ctx, prompt, quality)
 		}
 	}
 	tools := drawTools()
@@ -449,20 +466,46 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 				log.Err(err).Msg("Bad draw_image arguments")
 			}
 			out.Drawn++
+			// The last attempt gork is allowed is the picture the user keeps, so
+			// it is the one worth rendering at full quality: by now the prompt has
+			// been through up to two corrections and is probably right. Everything
+			// before it is a search and gets thrown away, so it stays on the fast
+			// profile. With no redraw budget (maxDraws 1) the single draw is an
+			// uncorrected first guess, so it does not get the two-minute profile:
+			// that case pays full price on every picture instead of one in three.
+			quality := out.Drawn == maxDraws && maxDraws > 1
 			// Record the prompt gork asked for, retry or not, and before the
 			// attempt: a draw that fails still needs to show up in the next
 			// turn's context, or the model has no idea it already tried.
 			hm.AddMessage(llm.ChatMessage{Role: "assistant", Content: toolCallPrefix + args.Prompt})
-			png, drawInfo, err := draw(ctx, args.Prompt)
+			// Logged before the request as well as after it: the quality profile
+			// takes ~2 minutes, so without a start line a slow or timed-out draw is
+			// indistinguishable from a bot that never tried, and the duration is the
+			// clearest proof of which profile actually ran.
+			drawStart := time.Now()
+			log.Info().Int("attempt", out.Drawn).Int("max_draws", maxDraws).
+				Bool("quality", quality).
+				Msg("Drawing")
+			png, drawInfo, err := draw(ctx, args.Prompt, quality)
+			// The render and the description are timed apart on purpose: they are
+			// two different services with two different tuning knobs (steps/CFG vs
+			// max_tokens), and one number covering both makes 15s of drawing and 2s
+			// of captioning read as an unexplained 27s.
+			drawMs := time.Since(drawStart).Milliseconds()
 			if err != nil {
-				log.Err(err).Str("draw_prompt", args.Prompt).Msg("Image generation failed")
+				log.Err(err).Str("draw_prompt", args.Prompt).
+					Bool("quality", quality).
+					Int64("draw_ms", drawMs).
+					Msg("Image generation failed")
 				history = append(history,
 					toolResult(call, "the drawing failed: "+err.Error()),
 					harnessTurn("The drawing failed. Reply to the user and say you could not draw it."))
 				continue
 			}
 
+			eyesStart := time.Now()
 			caption, captionErr := b.describeImage(ctx, png)
+			eyesMs := time.Since(eyesStart).Milliseconds()
 			if captionErr != nil {
 				log.Err(captionErr).Msg("Failed to describe generated image")
 			}
@@ -481,6 +524,8 @@ func (b *Bot) runToolLoop(ctx context.Context, msg message, hm *HistoryManager, 
 
 			lastPNG = png
 			log.Info().Int("attempt", out.Drawn).Int("max_draws", maxDraws).
+				Bool("quality", quality).
+				Int64("draw_ms", drawMs).Int64("eyes_ms", eyesMs).
 				Str("caption", caption).Str("sd_info", sdInfoSummary(drawInfo)).
 				Msg("Drew image")
 
